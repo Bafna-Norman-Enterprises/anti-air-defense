@@ -150,8 +150,10 @@ class KalmanFilter2D:
             app_sim = cand.get('appearance_similarity', 1.0)
 
             # Appearance Gate: Reject obvious color impostors if appearance signature is established
-            if app_sim < 0.30 and cand.get('has_appearance', False):
-                cand['rejection_reason'] = f"APPEARANCE_MISMATCH (sim={app_sim:.2f} < 0.30)"
+            # During fast motion / throws, motion blur can lower similarity; only reject single candidate if totally disjoint
+            min_app_sim = 0.08 if len(candidates) == 1 else 0.25
+            if app_sim < min_app_sim and cand.get('has_appearance', False):
+                cand['rejection_reason'] = f"APPEARANCE_MISMATCH (sim={app_sim:.2f} < {min_app_sim:.2f})"
                 clutter_candidates.append(cand)
                 continue
 
@@ -160,11 +162,11 @@ class KalmanFilter2D:
             if d2 <= self.gate_threshold:
                 cost = d2 + (r_diff * 6.0) + app_penalty
                 nominal_matches.append((cost, cand))
-            elif d2 <= self.maneuver_gate_threshold or (len(candidates) == 1 and d2 <= 400.0 and r_diff < 0.65):
-                cost = d2 + (r_diff * 40.0) + app_penalty
+            elif d2 <= self.maneuver_gate_threshold or len(candidates) == 1:
+                cost = d2 + (r_diff * 20.0) + app_penalty
                 maneuver_matches.append((cost, cand))
             else:
-                cand['rejection_reason'] = f"OUT_OF_GATE (d2={d2:.1f} > {self.gate_threshold:.1f})"
+                cand['rejection_reason'] = f"OUT_OF_GATE (d2={d2:.1f} > {self.maneuver_gate_threshold:.1f})"
                 clutter_candidates.append(cand)
 
         # Decision Logic:
@@ -185,7 +187,7 @@ class KalmanFilter2D:
             return best_match, clutter_candidates
 
         elif maneuver_matches:
-            # No nominal match found, but target is within maneuver envelope (e.g. bounce / sharp turn)
+            # High-G maneuver, sudden throw, or gravitational drop envelope
             maneuver_matches.sort(key=lambda item: item[0])
             best_match = maneuver_matches[0][1]
             best_match['is_maneuvering'] = True
@@ -196,6 +198,12 @@ class KalmanFilter2D:
 
             return best_match, clutter_candidates
 
+        elif len(candidates) == 1:
+            # Single unambiguous candidate in camera field: fast throw / drop capture
+            single_cand = candidates[0]
+            single_cand['is_maneuvering'] = True
+            return single_cand, []
+
         else:
             # All candidates outside both nominal and maneuver gates
             return None, clutter_candidates
@@ -203,8 +211,8 @@ class KalmanFilter2D:
     def update(self, z_x: float, z_y: float, is_maneuvering: bool = False) -> tuple[float, float]:
         """
         Corrects predicted state using the validated measurement (z_x, z_y).
-        If is_maneuvering is True, adaptively inflates velocity covariance so the filter
-        instantly tracks the new trajectory heading instead of lagging or dropping lock.
+        If is_maneuvering is True, adaptively inflates position and velocity covariance so the filter
+        instantly snaps to the new high-speed trajectory instead of lagging or dropping lock.
         Returns filtered (pos_x, pos_y).
         """
         z = np.array([[z_x], [z_y]], dtype=np.float64)
@@ -220,9 +228,11 @@ class KalmanFilter2D:
             return z_x, z_y
 
         if is_maneuvering:
-            # High-G acceleration / bounce detected: adaptively inflate velocity covariance
-            self.P[2, 2] += 250.0
-            self.P[3, 3] += 250.0
+            # High-G acceleration / throw / drop: adaptively inflate covariance for instantaneous catch-up
+            self.P[0, 0] += 60.0
+            self.P[1, 1] += 60.0
+            self.P[2, 2] += 800.0
+            self.P[3, 3] += 800.0
             self.S = self.H @ self.P @ self.H.T + self.R
             try:
                 self.S_inv = np.linalg.inv(self.S)

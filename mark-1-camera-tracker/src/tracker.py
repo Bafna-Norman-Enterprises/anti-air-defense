@@ -42,9 +42,9 @@ os.makedirs(DATA_DIR, exist_ok=True)
 CSV_PATH = os.path.join(DATA_DIR, "tracking_telemetry.csv")
 CALIBRATION_PATH = os.path.join(DATA_DIR, "hsv_calibration.json")
 
-# Default HSV Color Range for Light Pink target
-LOWER_HSV = np.array([140, 35, 120])
-UPPER_HSV = np.array([179, 200, 255])
+# Default HSV Color Range for Light Pink target (expanded to tolerate high-speed motion blur)
+LOWER_HSV = np.array([135, 25, 100])
+UPPER_HSV = np.array([179, 255, 255])
 
 # Load custom user calibration if available
 if os.path.exists(CALIBRATION_PATH):
@@ -57,7 +57,7 @@ if os.path.exists(CALIBRATION_PATH):
     except Exception as e:
         print(f"[WARNING] Could not parse calibration file: {e}")
 
-MIN_TARGET_RADIUS = 12    # Ignore tiny specks of noise smaller than this (pixels)
+MIN_TARGET_RADIUS = 6     # Detect fast-moving or distant targets (pixels)
 
 # HUD Colors (BGR format)
 HUD_WHITE = (235, 235, 235)
@@ -68,7 +68,7 @@ RETICLE_AMBER = (60, 200, 255)   # Amber/yellow for Kalman coasting
 
 
 def open_webcam(index=CAMERA_INDEX):
-    """Attempts to open real computer webcam with MJPG fast streaming."""
+    """Attempts to open real computer webcam with MJPG fast streaming and zero latency."""
     cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
     if not cap.isOpened():
         cap = cv2.VideoCapture(index)
@@ -77,6 +77,7 @@ def open_webcam(index=CAMERA_INDEX):
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
         cap.set(cv2.CAP_PROP_FPS, 30)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Zero-latency frame buffer prevents stale frame lag
         return cap
     return None
 
@@ -302,26 +303,26 @@ def main():
                 f = cv2.resize(f, (FRAME_WIDTH, FRAME_HEIGHT))
             return True, f
 
-    # Closed-loop PID Controllers - Tuned for fast evasion pickup
+    # Closed-loop PID Controllers - Tuned for high-speed evasion and rapid drops
     pan_pid = PIDController(
-        kp=0.025, ki=0.006, kd=0.0012,
-        deadband=1.0, output_limit=4.2,
-        integral_limit=15.0, d_filter_alpha=0.20,
+        kp=0.035, ki=0.008, kd=0.002,
+        deadband=0.5, output_limit=12.0,
+        integral_limit=20.0, d_filter_alpha=0.30,
     )
 
     tilt_pid = PIDController(
-        kp=0.025, ki=0.006, kd=0.0012,
-        deadband=1.0, output_limit=4.2,
-        integral_limit=15.0, d_filter_alpha=0.20,
+        kp=0.035, ki=0.008, kd=0.002,
+        deadband=0.5, output_limit=12.0,
+        integral_limit=20.0, d_filter_alpha=0.30,
     )
 
-    # 2D Kalman Filter with Adaptive Maneuver Gating for high-g turns and boundary bounces
+    # 2D Kalman Filter tuned for gravitational freefall (g ≈ 500 deg/s^2) & rapid projectile throws
     kf = KalmanFilter2D(
-        process_noise_accel=120.0,
-        measurement_noise=0.30,
-        max_coast_frames=75,
-        gate_threshold=16.0,
-        maneuver_gate_threshold=180.0,
+        process_noise_accel=650.0,
+        measurement_noise=0.20,
+        max_coast_frames=60,
+        gate_threshold=25.0,
+        maneuver_gate_threshold=900.0,
     )
 
     # Hardware Serial Bridge to Arduino Nano + PCA9685 (auto-detects or runs in Virtual Mock)
@@ -349,17 +350,19 @@ def main():
     show_pipper = True
     lead_time = 0.50
 
-    # Interactive Click-to-Designate state
+    # Interactive Click-to-Designate & Fullscreen state
     designated_click = None
     designation_flash_until = 0.0
     designated_color_name = "OPT-PINK"
     designation_msg = ""
+    is_fullscreen = False
 
     lower_hsv = LOWER_HSV.copy()
     upper_hsv = UPPER_HSV.copy()
 
     WINDOW_NAME = "BNE Mark 1 | TGP Optical HUD"
-    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WINDOW_NAME, FRAME_WIDTH, FRAME_HEIGHT)
 
     def on_mouse_click(event, x, y, flags, param):
         nonlocal designated_click
@@ -369,7 +372,7 @@ def main():
     cv2.setMouseCallback(WINDOW_NAME, on_mouse_click)
 
     print("[BNE MARK 1] Optical Tracker Online.")
-    print("[CONTROLS] Click = Lock Object | C = Cam/Sim | P = Pipper | T = Dynamics | D = Decoys | I = FLIR | R = Reset | Q = Quit")
+    print("[CONTROLS] Click = Lock Object | F = Fullscreen | C = Cam/Sim | P = Pipper | T = Dynamics | D = Decoys | I = FLIR | R = Reset | Q = Quit")
 
     while True:
         ret, frame = get_frame()
@@ -421,9 +424,9 @@ def main():
 
                     lower_h = med_h - h_span  # May be negative for red wrap-around
                     upper_h = med_h + h_span  # May exceed 179 for red wrap-around
-                    lower_s = max(45, med_s - s_span)  # Strict saturation floor prevents room leaks
+                    lower_s = max(25, med_s - s_span)  # S floor tolerates high-speed motion blur
                     upper_s = min(255, med_s + s_span)
-                    lower_v = max(45, med_v - 60)
+                    lower_v = max(35, med_v - 65)
                     upper_v = min(255, med_v + 65)
 
                     lower_hsv = np.array([lower_h, lower_s, lower_v])
@@ -458,8 +461,8 @@ def main():
 
         is_occluded = curr_t < occlusion_until
 
-        # 1. Color Segmentation
-        blurred = cv2.GaussianBlur(frame, (7, 7), 0)
+        # 1. Color Segmentation with Motion-Blur Tolerance
+        blurred = cv2.GaussianBlur(frame, (5, 5), 0)
         hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
 
         if lower_hsv[0] < 0:
@@ -473,8 +476,11 @@ def main():
             mask = cv2.bitwise_or(mask1, mask2)
         else:
             mask = cv2.inRange(hsv, lower_hsv, upper_hsv)
-        mask = cv2.erode(mask, None, iterations=2)
-        mask = cv2.dilate(mask, None, iterations=2)
+
+        # Single-pass 3x3 morphology cleans noise without destroying thin motion streaks
+        morph_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, morph_kernel, iterations=1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, morph_kernel, iterations=1)
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -487,16 +493,10 @@ def main():
         if contours and not is_occluded:
             for c in contours:
                 area = cv2.contourArea(c)
-                if area < 65:
+                if area < 30:
                     continue  # Ignore tiny noise specks
                 ((cx, cy), radius) = cv2.minEnclosingCircle(c)
                 if radius >= MIN_TARGET_RADIUS:
-                    # Circularity / compactness check: reject long thin streaks/seams
-                    circle_area = math.pi * (radius ** 2)
-                    solidity = area / max(circle_area, 1.0)
-                    if solidity < 0.20:
-                        continue  # Ignore non-compact elongated edges
-
                     M = cv2.moments(c)
                     if M["m00"] > 0:
                         blob_x = int(M["m10"] / M["m00"])
@@ -563,10 +563,10 @@ def main():
             error_px = math.hypot(dx, dy)
 
             # Velocity Feedforward: target motion in this time step (degrees)
-            # Injects 85% forward rate to bypass mechanical servo lag
+            # Injects 95% forward rate to bypass mechanical servo lag and catch fast drops/throws
             vel_x, vel_y = kf.velocity
-            ff_pan = 0.85 * (vel_x * dt)
-            ff_tilt = 0.85 * (vel_y * dt)
+            ff_pan = 0.95 * (vel_x * dt)
+            ff_tilt = 0.95 * (vel_y * dt)
 
             d_pan = pan_pid.update(dx, dt, feedforward=ff_pan)
             d_tilt = tilt_pid.update(-dy, dt, feedforward=ff_tilt)
@@ -708,6 +708,16 @@ def main():
             # Toggle Predictive Lead Pipper
             show_pipper = not show_pipper
             print(f"[HUD] Predictive Lead Pipper (+{lead_time:.2f}s): {'ENABLED' if show_pipper else 'DISABLED'}")
+        elif key in (ord("f"), ord("F")):
+            # Fullscreen toggle
+            is_fullscreen = not is_fullscreen
+            if is_fullscreen:
+                cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+                print("[DISPLAY] Fullscreen: ON (Press 'F' again to exit)")
+            else:
+                cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
+                cv2.resizeWindow(WINDOW_NAME, FRAME_WIDTH, FRAME_HEIGHT)
+                print("[DISPLAY] Fullscreen: OFF (Standard 640x480)")
         elif key in (ord("i"), ord("I")):
             flir_mode = not flir_mode
             print(f"[OPTICS] FLIR / Infrared Mode: {'ON' if flir_mode else 'OFF'}")

@@ -114,7 +114,8 @@ def draw_inverted_badge(img, text, x, y, bg_color=HUD_WHITE, text_color=HUD_DARK
 
 def draw_tgp_frame(
     img, mode_label, tracking_state, elapsed_sec, fps, lock_pct,
-    dx, dy, error_px, pan, tilt, vel_total, servo_status="MOCK", app_sim=1.0
+    dx, dy, error_px, pan, tilt, vel_total, servo_status="MOCK",
+    app_sim=1.0, range_m=None, target_label="OPT-PINK"
 ):
     """Draws a clean military Targeting Pod (TGP) perimeter HUD."""
     h, w = img.shape[:2]
@@ -162,9 +163,15 @@ def draw_tgp_frame(
         cv2.putText(img, f"V {vel_total:04.1f}D/S", (w - m - 82, 125), font, 0.38, HUD_DIM, 1, cv2.LINE_AA)
         cv2.putText(img, f"APP {int(app_sim * 100):02d}%", (w - m - 82, 145), font, 0.38,
                     RETICLE_GREEN if app_sim > 0.70 else RETICLE_AMBER, 1, cv2.LINE_AA)
+        if range_m is not None and range_m > 0:
+            cv2.putText(img, f"RNG {range_m:04.2f}M", (w - m - 82, 165), font, 0.38, RETICLE_GREEN, 1, cv2.LINE_AA)
+        else:
+            cv2.putText(img, "RNG ----M", (w - m - 82, 165), font, 0.38, HUD_DIM, 1, cv2.LINE_AA)
+    else:
+        cv2.putText(img, "RNG ----M", (w - m - 82, 165), font, 0.38, HUD_DIM, 1, cv2.LINE_AA)
 
     # 5. Bottom Rail Indicators & Timer
-    cv2.putText(img, "OPT-PINK", (130, h - m + 5), font, 0.43, HUD_WHITE, 1, cv2.LINE_AA)
+    cv2.putText(img, target_label, (130, h - m + 5), font, 0.43, HUD_WHITE, 1, cv2.LINE_AA)
     draw_inverted_badge(img, "TGP", 302, h - m + 5, bg_color=HUD_WHITE, text_color=HUD_DARK)
     cv2.putText(img, "LOG:SPC", (455, h - m + 5), font, 0.43, HUD_DIM, 1, cv2.LINE_AA)
 
@@ -348,8 +355,33 @@ def main():
     show_pipper = True
     lead_time = 0.50
 
+    # Interactive Click-to-Designate & Fullscreen state
+    designated_click = None
+    designation_flash_until = 0.0
+    designated_color_name = "OPT-PINK"
+    is_fullscreen = False
+
+    # Stadiametric Rangefinder parameters (focal length for 55 deg FOV @ 640px = ~614.7px)
+    focal_px = (FRAME_WIDTH / 2.0) / math.tan(math.radians(FOV_H / 2.0))
+    TARGET_REAL_DIAMETER_M = 0.065  # Standard target reference diameter (6.5 cm ball)
+    smoothed_range_m = 1.0
+
+    lower_hsv = LOWER_HSV.copy()
+    upper_hsv = UPPER_HSV.copy()
+
+    WINDOW_NAME = "BNE Mark 1 | TGP Optical HUD"
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WINDOW_NAME, FRAME_WIDTH, FRAME_HEIGHT)
+
+    def on_mouse_click(event, x, y, flags, param):
+        nonlocal designated_click
+        if event == cv2.EVENT_LBUTTONDOWN:
+            designated_click = (int(np.clip(x, 0, FRAME_WIDTH - 1)), int(np.clip(y, 0, FRAME_HEIGHT - 1)))
+
+    cv2.setMouseCallback(WINDOW_NAME, on_mouse_click)
+
     print("[BNE MARK 1] Optical Tracker Online.")
-    print("[CONTROLS] C = Webcam/Sim | T = Dynamics | D = Decoys | P = Lead Pipper | O = Occlude | R = Reset | Q = Quit")
+    print("[CONTROLS] Click = Lock Any Object | F = Fullscreen | C = Webcam/Sim | P = Pipper | T = Dynamics | D = Decoys | I = FLIR | R = Reset | Q = Quit")
 
     while True:
         ret, frame = get_frame()
@@ -360,6 +392,64 @@ def main():
         total_frames += 1
         height, width = frame.shape[:2]
         frame_cx, frame_cy = width // 2, height // 2
+
+        # Process Operator Click-to-Lock Designation
+        if designated_click is not None:
+            cx, cy = designated_click
+            designated_click = None
+
+            px1 = max(0, cx - 10)
+            py1 = max(0, cy - 10)
+            px2 = min(width, cx + 10)
+            py2 = min(height, cy + 10)
+            patch = frame[py1:py2, px1:px2]
+
+            if patch.size > 0:
+                patch_hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+                med_h = int(np.median(patch_hsv[:, :, 0]))
+                med_s = int(np.median(patch_hsv[:, :, 1]))
+                med_v = int(np.median(patch_hsv[:, :, 2]))
+
+                # Adaptive color margins
+                lower_h = max(0, med_h - 18)
+                upper_h = min(179, med_h + 18)
+                lower_s = max(35, med_s - 65)
+                upper_s = min(255, med_s + 75)
+                lower_v = max(40, med_v - 75)
+                upper_v = min(255, med_v + 75)
+
+                lower_hsv = np.array([lower_h, lower_s, lower_v])
+                upper_hsv = np.array([upper_h, upper_s, upper_v])
+
+                if med_s < 45 and med_v > 180:
+                    designated_color_name = "OPT-WHITE"
+                elif med_v < 45:
+                    designated_color_name = "OPT-DARK"
+                elif med_h < 12 or med_h > 168:
+                    designated_color_name = "OPT-RED"
+                elif 12 <= med_h < 26:
+                    designated_color_name = "OPT-ORANGE"
+                elif 26 <= med_h < 35:
+                    designated_color_name = "OPT-YELLOW"
+                elif 35 <= med_h < 85:
+                    designated_color_name = "OPT-GREEN"
+                elif 85 <= med_h < 130:
+                    designated_color_name = "OPT-BLUE"
+                elif 130 <= med_h < 155:
+                    designated_color_name = "OPT-PURPLE"
+                else:
+                    designated_color_name = "OPT-PINK"
+
+                appearance.reset()
+                appearance.update(frame, cx, cy, radius=18.0)
+
+                meas_pan = current_pan + (cx - frame_cx) / PX_PER_DEG_X
+                meas_tilt = current_tilt - (cy - frame_cy) / PX_PER_DEG_Y
+                kf.reset()
+                kf.update(meas_pan, meas_tilt)
+
+                designation_flash_until = curr_t + 1.5
+                print(f"[OPERATOR DESIGNATION] Locked on HSV({med_h}, {med_s}, {med_v}) -> Label: {designated_color_name}")
 
         curr_t = time.perf_counter()
         dt = max(min(curr_t - prev_t, 0.05), 1e-4)
@@ -372,7 +462,7 @@ def main():
         blurred = cv2.GaussianBlur(frame, (7, 7), 0)
         hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
 
-        mask = cv2.inRange(hsv, LOWER_HSV, UPPER_HSV)
+        mask = cv2.inRange(hsv, lower_hsv, upper_hsv)
         mask = cv2.erode(mask, None, iterations=2)
         mask = cv2.dilate(mask, None, iterations=2)
 
@@ -423,6 +513,11 @@ def main():
                 best_target["pos_x"], best_target["pos_y"], is_maneuvering=is_man
             )
             target_radius = int(best_target["radius"])
+
+            # Stadiametric Optical Range Calculation
+            raw_range_m = (focal_px * TARGET_REAL_DIAMETER_M) / max(2.0 * target_radius, 2.0)
+            smoothed_range_m = float(np.clip(0.88 * smoothed_range_m + 0.12 * raw_range_m, 0.20, 25.0))
+
             # Online adaptive appearance learning on confirmed target
             appearance.update(frame, best_target["screen_x"], best_target["screen_y"], target_radius)
             current_app_sim = best_target.get("appearance_similarity", 1.0)
@@ -534,23 +629,28 @@ def main():
         draw_tgp_frame(
             display, mode_label, tracking_state, elapsed_sec, avg_fps, lock_pct,
             dx, dy, error_px, current_pan, current_tilt, vel_total,
-            servo_status=servo_tag, app_sim=current_app_sim
+            servo_status=servo_tag, app_sim=current_app_sim,
+            range_m=smoothed_range_m, target_label=designated_color_name
         )
+
+        if curr_t < designation_flash_until:
+            draw_inverted_badge(display, f"DESIGNATED: {designated_color_name}", frame_cx - 100, 45,
+                                bg_color=(240, 220, 80), text_color=HUD_DARK)
 
         if is_occluded:
             rem = occlusion_until - curr_t
-            draw_inverted_badge(display, f"OCCLUSION PULSE ({rem:.1f}S)", frame_cx - 95, 45,
+            draw_inverted_badge(display, f"OCCLUSION PULSE ({rem:.1f}S)", frame_cx - 95, 66,
                                 bg_color=RETICLE_AMBER, text_color=HUD_DARK)
 
         if use_simulator and sim_cam.show_decoys:
-            draw_inverted_badge(display, "CLUTTER / DECOYS ACTIVE", frame_cx - 90, 66,
+            draw_inverted_badge(display, "CLUTTER / DECOYS ACTIVE", frame_cx - 90, 87,
                                 bg_color=(60, 60, 180), text_color=HUD_WHITE)
 
         if curr_t < log_flash_until:
             draw_inverted_badge(display, "EVENT LOGGED", frame_cx - 52, height - 42,
                                 bg_color=RETICLE_GREEN, text_color=HUD_DARK)
 
-        cv2.imshow("BNE Mark 1 | TGP Optical HUD", display)
+        cv2.imshow(WINDOW_NAME, display)
         if show_mask:
             cv2.imshow("BNE Mark 1 | HSV Mask Debug", mask)
 
@@ -589,6 +689,19 @@ def main():
             # Toggle Predictive Lead Pipper
             show_pipper = not show_pipper
             print(f"[HUD] Predictive Lead Pipper (+{lead_time:.2f}s): {'ENABLED' if show_pipper else 'DISABLED'}")
+        elif key in (ord("f"), ord("F")):
+            # Fullscreen toggle
+            is_fullscreen = not is_fullscreen
+            if is_fullscreen:
+                cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+                print("[DISPLAY] Fullscreen: ON (Press 'F' again to exit)")
+            else:
+                cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
+                cv2.resizeWindow(WINDOW_NAME, FRAME_WIDTH, FRAME_HEIGHT)
+                print("[DISPLAY] Fullscreen: OFF (Standard 640x480)")
+        elif key in (ord("i"), ord("I")):
+            flir_mode = not flir_mode
+            print(f"[OPTICS] FLIR / Infrared Mode: {'ON' if flir_mode else 'OFF'}")
         elif key == ord("o"):
             occlusion_until = curr_t + 1.2
             print("[TEST] 1.2s Occlusion Pulse triggered! Watch Kalman coasting.")
@@ -598,13 +711,15 @@ def main():
             pan_pid.reset()
             tilt_pid.reset()
             kf.reset()
+            appearance.reset()
+            lower_hsv = LOWER_HSV.copy()
+            upper_hsv = UPPER_HSV.copy()
+            designated_color_name = "OPT-PINK"
             occlusion_until = 0.0
             serial_gimbal.send_angles(PAN_NEUTRAL, TILT_NEUTRAL)
             if use_simulator:
                 sim_cam.reset_target()
-            print("[RESET] Gimbal and target centered to 90.0 boresight.")
-        elif key == ord("f"):
-            flir_mode = not flir_mode
+            print("[RESET] Gimbal, target, and color thresholds reset to defaults.")
         elif key == ord("m"):
             show_mask = not show_mask
             if not show_mask:

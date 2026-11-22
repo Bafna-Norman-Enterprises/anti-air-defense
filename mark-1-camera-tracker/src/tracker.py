@@ -66,6 +66,14 @@ HUD_DARK = (20, 20, 20)
 RETICLE_GREEN = (120, 255, 120)  # Light green for optical lock
 RETICLE_AMBER = (60, 200, 255)   # Amber/yellow for Kalman coasting
 
+# Stadiametric Rangefinder reference target presets: (Display Name, Physical Diameter in Meters)
+TARGET_PRESETS = [
+    ("6.5CM (BALL)", 0.065),
+    ("4.0CM (SMALL)", 0.040),
+    ("10.0CM (MUG/CAN)", 0.100),
+    ("15.0CM (DRONE/HAND)", 0.150),
+]
+
 
 def open_webcam(index=CAMERA_INDEX):
     """Attempts to open real computer webcam with MJPG fast streaming."""
@@ -115,7 +123,7 @@ def draw_inverted_badge(img, text, x, y, bg_color=HUD_WHITE, text_color=HUD_DARK
 def draw_tgp_frame(
     img, mode_label, tracking_state, elapsed_sec, fps, lock_pct,
     dx, dy, error_px, pan, tilt, vel_total, servo_status="MOCK",
-    app_sim=1.0, range_m=None, target_label="OPT-PINK"
+    app_sim=1.0, range_m=None, target_label="OPT-PINK", cal_label="6.5CM"
 ):
     """Draws a clean military Targeting Pod (TGP) perimeter HUD."""
     h, w = img.shape[:2]
@@ -167,8 +175,10 @@ def draw_tgp_frame(
             cv2.putText(img, f"RNG {range_m:04.2f}M", (w - m - 82, 165), font, 0.38, RETICLE_GREEN, 1, cv2.LINE_AA)
         else:
             cv2.putText(img, "RNG ----M", (w - m - 82, 165), font, 0.38, HUD_DIM, 1, cv2.LINE_AA)
+        cv2.putText(img, f"CAL {cal_label}", (w - m - 82, 182), font, 0.32, HUD_DIM, 1, cv2.LINE_AA)
     else:
         cv2.putText(img, "RNG ----M", (w - m - 82, 165), font, 0.38, HUD_DIM, 1, cv2.LINE_AA)
+        cv2.putText(img, f"CAL {cal_label}", (w - m - 82, 182), font, 0.32, HUD_DIM, 1, cv2.LINE_AA)
 
     # 5. Bottom Rail Indicators & Timer
     cv2.putText(img, target_label, (130, h - m + 5), font, 0.43, HUD_WHITE, 1, cv2.LINE_AA)
@@ -361,9 +371,13 @@ def main():
     designated_color_name = "OPT-PINK"
     is_fullscreen = False
 
-    # Stadiametric Rangefinder parameters (focal length for 55 deg FOV @ 640px = ~614.7px)
+    # Stadiametric Rangefinder reference target presets
+    target_preset_idx = 0
+    preset_flash_until = 0.0
+    designation_msg = ""
+
+    # Focal length for 55 deg horizontal FOV @ 640px = ~614.7px
     focal_px = (FRAME_WIDTH / 2.0) / math.tan(math.radians(FOV_H / 2.0))
-    TARGET_REAL_DIAMETER_M = 0.065  # Standard target reference diameter (6.5 cm ball)
     smoothed_range_m = 1.0
 
     lower_hsv = LOWER_HSV.copy()
@@ -381,13 +395,18 @@ def main():
     cv2.setMouseCallback(WINDOW_NAME, on_mouse_click)
 
     print("[BNE MARK 1] Optical Tracker Online.")
-    print("[CONTROLS] Click = Lock Any Object | F = Fullscreen | C = Webcam/Sim | P = Pipper | T = Dynamics | D = Decoys | I = FLIR | R = Reset | Q = Quit")
+    print("[CONTROLS] Click = Lock Object | [ / ] = Target Size | F = Fullscreen | C = Cam/Sim | P = Pipper | T = Dynamics | D = Decoys | I = FLIR | R = Reset | Q = Quit")
 
     while True:
         ret, frame = get_frame()
         if not ret:
             print("[ERROR] Failed to read frame.")
             break
+
+        curr_t = time.perf_counter()
+        dt = max(min(curr_t - prev_t, 0.05), 1e-4)
+        frame_times.append(curr_t - prev_t)
+        prev_t = curr_t
 
         total_frames += 1
         height, width = frame.shape[:2]
@@ -410,51 +429,58 @@ def main():
                 med_s = int(np.median(patch_hsv[:, :, 1]))
                 med_v = int(np.median(patch_hsv[:, :, 2]))
 
-                # Adaptive color margins
-                lower_h = max(0, med_h - 18)
-                upper_h = min(179, med_h + 18)
-                lower_s = max(35, med_s - 65)
-                upper_s = min(255, med_s + 75)
-                lower_v = max(40, med_v - 75)
-                upper_v = min(255, med_v + 75)
-
-                lower_hsv = np.array([lower_h, lower_s, lower_v])
-                upper_hsv = np.array([upper_h, upper_s, upper_v])
-
-                if med_s < 45 and med_v > 180:
-                    designated_color_name = "OPT-WHITE"
-                elif med_v < 45:
-                    designated_color_name = "OPT-DARK"
-                elif med_h < 12 or med_h > 168:
-                    designated_color_name = "OPT-RED"
-                elif 12 <= med_h < 26:
-                    designated_color_name = "OPT-ORANGE"
-                elif 26 <= med_h < 35:
-                    designated_color_name = "OPT-YELLOW"
-                elif 35 <= med_h < 85:
-                    designated_color_name = "OPT-GREEN"
-                elif 85 <= med_h < 130:
-                    designated_color_name = "OPT-BLUE"
-                elif 130 <= med_h < 155:
-                    designated_color_name = "OPT-PURPLE"
+                # Guard: Reject desaturated/neutral objects (walls, desks, skin, shadows)
+                if med_s < 45:
+                    designation_msg = "REJECTED: LOW SATURATION (CLICK COLORFUL OBJECT)"
+                    designation_flash_until = curr_t + 2.0
+                    print(f"[DESIGNATION REJECTED] S={med_s} < 45. Please click a colorful target.")
+                elif med_v < 40:
+                    designation_msg = "REJECTED: TOO DARK (CLICK WELL-LIT OBJECT)"
+                    designation_flash_until = curr_t + 2.0
+                    print(f"[DESIGNATION REJECTED] V={med_v} < 40. Target is too dark.")
                 else:
-                    designated_color_name = "OPT-PINK"
+                    # Tight, robust color bounds with strict saturation floor
+                    std_h = float(np.std(patch_hsv[:, :, 0]))
+                    std_s = float(np.std(patch_hsv[:, :, 1]))
+                    h_span = max(int(std_h * 2.2), 12)
+                    s_span = max(int(std_s * 2.0), 35)
 
-                appearance.reset()
-                appearance.update(frame, cx, cy, radius=18.0)
+                    lower_h = med_h - h_span  # May be negative for red wrap-around
+                    upper_h = med_h + h_span  # May exceed 179 for red wrap-around
+                    lower_s = max(45, med_s - s_span)  # Strict saturation floor prevents room leaks
+                    upper_s = min(255, med_s + s_span)
+                    lower_v = max(45, med_v - 60)
+                    upper_v = min(255, med_v + 65)
 
-                meas_pan = current_pan + (cx - frame_cx) / PX_PER_DEG_X
-                meas_tilt = current_tilt - (cy - frame_cy) / PX_PER_DEG_Y
-                kf.reset()
-                kf.update(meas_pan, meas_tilt)
+                    lower_hsv = np.array([lower_h, lower_s, lower_v])
+                    upper_hsv = np.array([upper_h, upper_s, upper_v])
 
-                designation_flash_until = curr_t + 1.5
-                print(f"[OPERATOR DESIGNATION] Locked on HSV({med_h}, {med_s}, {med_v}) -> Label: {designated_color_name}")
+                    if med_h < 10 or med_h > 168:
+                        designated_color_name = "OPT-RED"
+                    elif 10 <= med_h < 26:
+                        designated_color_name = "OPT-ORANGE"
+                    elif 26 <= med_h < 35:
+                        designated_color_name = "OPT-YELLOW"
+                    elif 35 <= med_h < 85:
+                        designated_color_name = "OPT-GREEN"
+                    elif 85 <= med_h < 130:
+                        designated_color_name = "OPT-BLUE"
+                    elif 130 <= med_h < 152:
+                        designated_color_name = "OPT-PURPLE"
+                    else:
+                        designated_color_name = "OPT-PINK"
 
-        curr_t = time.perf_counter()
-        dt = max(min(curr_t - prev_t, 0.05), 1e-4)
-        frame_times.append(curr_t - prev_t)
-        prev_t = curr_t
+                    appearance.reset()
+                    appearance.update(frame, cx, cy, radius=18.0)
+
+                    meas_pan = current_pan + (cx - frame_cx) / PX_PER_DEG_X
+                    meas_tilt = current_tilt - (cy - frame_cy) / PX_PER_DEG_Y
+                    kf.reset()
+                    kf.update(meas_pan, meas_tilt)
+
+                    designation_msg = f"DESIGNATED: {designated_color_name}"
+                    designation_flash_until = curr_t + 1.5
+                    print(f"[OPERATOR DESIGNATION] Locked on HSV({med_h}, {med_s}, {med_v}) -> Label: {designated_color_name}")
 
         is_occluded = curr_t < occlusion_until
 
@@ -462,7 +488,17 @@ def main():
         blurred = cv2.GaussianBlur(frame, (7, 7), 0)
         hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
 
-        mask = cv2.inRange(hsv, lower_hsv, upper_hsv)
+        if lower_hsv[0] < 0:
+            # Dual wrap-around mask for red
+            mask1 = cv2.inRange(hsv, np.array([0, lower_hsv[1], lower_hsv[2]]), np.array([upper_hsv[0], upper_hsv[1], upper_hsv[2]]))
+            mask2 = cv2.inRange(hsv, np.array([180 + lower_hsv[0], lower_hsv[1], lower_hsv[2]]), np.array([179, upper_hsv[1], upper_hsv[2]]))
+            mask = cv2.bitwise_or(mask1, mask2)
+        elif upper_hsv[0] > 179:
+            mask1 = cv2.inRange(hsv, np.array([lower_hsv[0], lower_hsv[1], lower_hsv[2]]), np.array([179, upper_hsv[1], upper_hsv[2]]))
+            mask2 = cv2.inRange(hsv, np.array([0, lower_hsv[1], lower_hsv[2]]), np.array([upper_hsv[0] - 180, upper_hsv[1], upper_hsv[2]]))
+            mask = cv2.bitwise_or(mask1, mask2)
+        else:
+            mask = cv2.inRange(hsv, lower_hsv, upper_hsv)
         mask = cv2.erode(mask, None, iterations=2)
         mask = cv2.dilate(mask, None, iterations=2)
 
@@ -476,8 +512,17 @@ def main():
 
         if contours and not is_occluded:
             for c in contours:
+                area = cv2.contourArea(c)
+                if area < 65:
+                    continue  # Ignore tiny noise specks
                 ((cx, cy), radius) = cv2.minEnclosingCircle(c)
                 if radius >= MIN_TARGET_RADIUS:
+                    # Circularity / compactness check: reject long thin streaks/seams
+                    circle_area = math.pi * (radius ** 2)
+                    solidity = area / max(circle_area, 1.0)
+                    if solidity < 0.20:
+                        continue  # Ignore non-compact elongated edges
+
                     M = cv2.moments(c)
                     if M["m00"] > 0:
                         blob_x = int(M["m10"] / M["m00"])
@@ -514,8 +559,9 @@ def main():
             )
             target_radius = int(best_target["radius"])
 
-            # Stadiametric Optical Range Calculation
-            raw_range_m = (focal_px * TARGET_REAL_DIAMETER_M) / max(2.0 * target_radius, 2.0)
+            # Stadiametric Optical Range Calculation using calibrated target reference size
+            target_real_diam = TARGET_PRESETS[target_preset_idx][1]
+            raw_range_m = (focal_px * target_real_diam) / max(2.0 * target_radius, 2.0)
             smoothed_range_m = float(np.clip(0.88 * smoothed_range_m + 0.12 * raw_range_m, 0.20, 25.0))
 
             # Online adaptive appearance learning on confirmed target
@@ -588,14 +634,15 @@ def main():
         else:
             display = frame
 
-        # Draw rejected clutter/decoys with dim red/gray warning boxes
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        for clut in rejected_clutter:
-            csx = clut["screen_x"]
-            csy = clut["screen_y"]
-            cr = int(clut["radius"])
-            cv2.rectangle(display, (csx - cr, csy - cr), (csx + cr, csy + cr), (75, 75, 75), 1, cv2.LINE_AA)
-            cv2.putText(display, "REJ", (csx - cr, csy - cr - 4), font, 0.35, (80, 80, 220), 1, cv2.LINE_AA)
+        # Draw rejected clutter/decoys with dim red/gray warning boxes ONLY in simulator when decoys are active
+        if use_simulator and sim_cam.show_decoys:
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            for clut in rejected_clutter:
+                csx = clut["screen_x"]
+                csy = clut["screen_y"]
+                cr = int(clut["radius"])
+                cv2.rectangle(display, (csx - cr, csy - cr), (csx + cr, csy + cr), (75, 75, 75), 1, cv2.LINE_AA)
+                cv2.putText(display, "REJ", (csx - cr, csy - cr - 4), font, 0.35, (80, 80, 220), 1, cv2.LINE_AA)
 
         # Draw Target Reticle & Tracking Vector
         if tracking_state in ("LOCK", "CST"):
@@ -625,17 +672,26 @@ def main():
         servo_tag = "LINK" if serial_gimbal.is_connected else "MOCK"
 
         # 7. Draw HUD
+        cal_label = TARGET_PRESETS[target_preset_idx][0].split()[0]
         draw_tgp_boresight(display, frame_cx, frame_cy)
         draw_tgp_frame(
             display, mode_label, tracking_state, elapsed_sec, avg_fps, lock_pct,
             dx, dy, error_px, current_pan, current_tilt, vel_total,
             servo_status=servo_tag, app_sim=current_app_sim,
-            range_m=smoothed_range_m, target_label=designated_color_name
+            range_m=smoothed_range_m, target_label=designated_color_name,
+            cal_label=cal_label
         )
 
-        if curr_t < designation_flash_until:
-            draw_inverted_badge(display, f"DESIGNATED: {designated_color_name}", frame_cx - 100, 45,
-                                bg_color=(240, 220, 80), text_color=HUD_DARK)
+        if curr_t < preset_flash_until:
+            preset_name = TARGET_PRESETS[target_preset_idx][0]
+            draw_inverted_badge(display, f"RNG CAL: {preset_name}", frame_cx - 95, 45,
+                                bg_color=(200, 220, 255), text_color=HUD_DARK)
+        elif curr_t < designation_flash_until:
+            badge_bg = (240, 220, 80) if "REJECTED" not in designation_msg else (60, 60, 200)
+            badge_text = HUD_DARK if "REJECTED" not in designation_msg else HUD_WHITE
+            badge_x = frame_cx - 145 if "REJECTED" in designation_msg else frame_cx - 100
+            draw_inverted_badge(display, designation_msg, badge_x, 45,
+                                bg_color=badge_bg, text_color=badge_text)
 
         if is_occluded:
             rem = occlusion_until - curr_t
@@ -669,6 +725,16 @@ def main():
                 ])
             log_flash_until = curr_t + 0.8
             print(f"[LOGGED] {ts} | {source_tag} | {tracking_state} | ERR: {error_px:.2f} px | VEL: {vel_total:.1f} d/s")
+        elif key in (ord("["), ord("{")):
+            target_preset_idx = (target_preset_idx - 1) % len(TARGET_PRESETS)
+            preset_name = TARGET_PRESETS[target_preset_idx][0]
+            preset_flash_until = curr_t + 1.8
+            print(f"[RANGEFINDER] Calibrated Target Size: {preset_name}")
+        elif key in (ord("]"), ord("}")):
+            target_preset_idx = (target_preset_idx + 1) % len(TARGET_PRESETS)
+            preset_name = TARGET_PRESETS[target_preset_idx][0]
+            preset_flash_until = curr_t + 1.8
+            print(f"[RANGEFINDER] Calibrated Target Size: {preset_name}")
         elif key == ord("c"):
             # Toggle between Simulator and Real Webcam
             use_simulator = not use_simulator

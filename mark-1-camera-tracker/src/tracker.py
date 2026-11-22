@@ -66,14 +66,6 @@ HUD_DARK = (20, 20, 20)
 RETICLE_GREEN = (120, 255, 120)  # Light green for optical lock
 RETICLE_AMBER = (60, 200, 255)   # Amber/yellow for Kalman coasting
 
-# Stadiametric Rangefinder reference target presets: (Display Name, Physical Diameter in Meters)
-TARGET_PRESETS = [
-    ("6.5CM (BALL)", 0.065),
-    ("4.0CM (SMALL)", 0.040),
-    ("10.0CM (MUG/CAN)", 0.100),
-    ("15.0CM (DRONE/HAND)", 0.150),
-]
-
 
 def open_webcam(index=CAMERA_INDEX):
     """Attempts to open real computer webcam with MJPG fast streaming."""
@@ -123,7 +115,7 @@ def draw_inverted_badge(img, text, x, y, bg_color=HUD_WHITE, text_color=HUD_DARK
 def draw_tgp_frame(
     img, mode_label, tracking_state, elapsed_sec, fps, lock_pct,
     dx, dy, error_px, pan, tilt, vel_total, servo_status="MOCK",
-    app_sim=1.0, range_m=None, target_label="OPT-PINK", cal_label="6.5CM"
+    app_sim=1.0, target_label="OPT-PINK"
 ):
     """Draws a clean military Targeting Pod (TGP) perimeter HUD."""
     h, w = img.shape[:2]
@@ -171,14 +163,6 @@ def draw_tgp_frame(
         cv2.putText(img, f"V {vel_total:04.1f}D/S", (w - m - 82, 125), font, 0.38, HUD_DIM, 1, cv2.LINE_AA)
         cv2.putText(img, f"APP {int(app_sim * 100):02d}%", (w - m - 82, 145), font, 0.38,
                     RETICLE_GREEN if app_sim > 0.70 else RETICLE_AMBER, 1, cv2.LINE_AA)
-        if range_m is not None and range_m > 0:
-            cv2.putText(img, f"RNG {range_m:04.2f}M", (w - m - 82, 165), font, 0.38, RETICLE_GREEN, 1, cv2.LINE_AA)
-        else:
-            cv2.putText(img, "RNG ----M", (w - m - 82, 165), font, 0.38, HUD_DIM, 1, cv2.LINE_AA)
-        cv2.putText(img, f"CAL {cal_label}", (w - m - 82, 182), font, 0.32, HUD_DIM, 1, cv2.LINE_AA)
-    else:
-        cv2.putText(img, "RNG ----M", (w - m - 82, 165), font, 0.38, HUD_DIM, 1, cv2.LINE_AA)
-        cv2.putText(img, f"CAL {cal_label}", (w - m - 82, 182), font, 0.32, HUD_DIM, 1, cv2.LINE_AA)
 
     # 5. Bottom Rail Indicators & Timer
     cv2.putText(img, target_label, (130, h - m + 5), font, 0.43, HUD_WHITE, 1, cv2.LINE_AA)
@@ -365,27 +349,17 @@ def main():
     show_pipper = True
     lead_time = 0.50
 
-    # Interactive Click-to-Designate & Fullscreen state
+    # Interactive Click-to-Designate state
     designated_click = None
     designation_flash_until = 0.0
     designated_color_name = "OPT-PINK"
-    is_fullscreen = False
-
-    # Stadiametric Rangefinder reference target presets
-    target_preset_idx = 0
-    preset_flash_until = 0.0
     designation_msg = ""
-
-    # Focal length for 55 deg horizontal FOV @ 640px = ~614.7px
-    focal_px = (FRAME_WIDTH / 2.0) / math.tan(math.radians(FOV_H / 2.0))
-    smoothed_range_m = 1.0
 
     lower_hsv = LOWER_HSV.copy()
     upper_hsv = UPPER_HSV.copy()
 
     WINDOW_NAME = "BNE Mark 1 | TGP Optical HUD"
-    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(WINDOW_NAME, FRAME_WIDTH, FRAME_HEIGHT)
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
 
     def on_mouse_click(event, x, y, flags, param):
         nonlocal designated_click
@@ -395,7 +369,7 @@ def main():
     cv2.setMouseCallback(WINDOW_NAME, on_mouse_click)
 
     print("[BNE MARK 1] Optical Tracker Online.")
-    print("[CONTROLS] Click = Lock Object | [ / ] = Target Size | F = Fullscreen | C = Cam/Sim | P = Pipper | T = Dynamics | D = Decoys | I = FLIR | R = Reset | Q = Quit")
+    print("[CONTROLS] Click = Lock Object | C = Cam/Sim | P = Pipper | T = Dynamics | D = Decoys | I = FLIR | R = Reset | Q = Quit")
 
     while True:
         ret, frame = get_frame()
@@ -559,11 +533,6 @@ def main():
             )
             target_radius = int(best_target["radius"])
 
-            # Stadiametric Optical Range Calculation using calibrated target reference size
-            target_real_diam = TARGET_PRESETS[target_preset_idx][1]
-            raw_range_m = (focal_px * target_real_diam) / max(2.0 * target_radius, 2.0)
-            smoothed_range_m = float(np.clip(0.88 * smoothed_range_m + 0.12 * raw_range_m, 0.20, 25.0))
-
             # Online adaptive appearance learning on confirmed target
             appearance.update(frame, best_target["screen_x"], best_target["screen_y"], target_radius)
             current_app_sim = best_target.get("appearance_similarity", 1.0)
@@ -672,21 +641,15 @@ def main():
         servo_tag = "LINK" if serial_gimbal.is_connected else "MOCK"
 
         # 7. Draw HUD
-        cal_label = TARGET_PRESETS[target_preset_idx][0].split()[0]
         draw_tgp_boresight(display, frame_cx, frame_cy)
         draw_tgp_frame(
             display, mode_label, tracking_state, elapsed_sec, avg_fps, lock_pct,
             dx, dy, error_px, current_pan, current_tilt, vel_total,
             servo_status=servo_tag, app_sim=current_app_sim,
-            range_m=smoothed_range_m, target_label=designated_color_name,
-            cal_label=cal_label
+            target_label=designated_color_name
         )
 
-        if curr_t < preset_flash_until:
-            preset_name = TARGET_PRESETS[target_preset_idx][0]
-            draw_inverted_badge(display, f"RNG CAL: {preset_name}", frame_cx - 95, 45,
-                                bg_color=(200, 220, 255), text_color=HUD_DARK)
-        elif curr_t < designation_flash_until:
+        if curr_t < designation_flash_until:
             badge_bg = (240, 220, 80) if "REJECTED" not in designation_msg else (60, 60, 200)
             badge_text = HUD_DARK if "REJECTED" not in designation_msg else HUD_WHITE
             badge_x = frame_cx - 145 if "REJECTED" in designation_msg else frame_cx - 100
@@ -725,16 +688,6 @@ def main():
                 ])
             log_flash_until = curr_t + 0.8
             print(f"[LOGGED] {ts} | {source_tag} | {tracking_state} | ERR: {error_px:.2f} px | VEL: {vel_total:.1f} d/s")
-        elif key in (ord("["), ord("{")):
-            target_preset_idx = (target_preset_idx - 1) % len(TARGET_PRESETS)
-            preset_name = TARGET_PRESETS[target_preset_idx][0]
-            preset_flash_until = curr_t + 1.8
-            print(f"[RANGEFINDER] Calibrated Target Size: {preset_name}")
-        elif key in (ord("]"), ord("}")):
-            target_preset_idx = (target_preset_idx + 1) % len(TARGET_PRESETS)
-            preset_name = TARGET_PRESETS[target_preset_idx][0]
-            preset_flash_until = curr_t + 1.8
-            print(f"[RANGEFINDER] Calibrated Target Size: {preset_name}")
         elif key == ord("c"):
             # Toggle between Simulator and Real Webcam
             use_simulator = not use_simulator
@@ -755,16 +708,6 @@ def main():
             # Toggle Predictive Lead Pipper
             show_pipper = not show_pipper
             print(f"[HUD] Predictive Lead Pipper (+{lead_time:.2f}s): {'ENABLED' if show_pipper else 'DISABLED'}")
-        elif key in (ord("f"), ord("F")):
-            # Fullscreen toggle
-            is_fullscreen = not is_fullscreen
-            if is_fullscreen:
-                cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-                print("[DISPLAY] Fullscreen: ON (Press 'F' again to exit)")
-            else:
-                cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
-                cv2.resizeWindow(WINDOW_NAME, FRAME_WIDTH, FRAME_HEIGHT)
-                print("[DISPLAY] Fullscreen: OFF (Standard 640x480)")
         elif key in (ord("i"), ord("I")):
             flir_mode = not flir_mode
             print(f"[OPTICS] FLIR / Infrared Mode: {'ON' if flir_mode else 'OFF'}")

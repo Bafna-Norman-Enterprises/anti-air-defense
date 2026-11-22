@@ -11,6 +11,7 @@ from simulator import VirtualCamera
 from pid import PIDController
 from kalman import KalmanFilter2D
 from serial_interface import GimbalSerialController
+from appearance import AppearanceModel
 
 # ==========================================
 # CONFIGURATION & CONSTANTS
@@ -113,7 +114,7 @@ def draw_inverted_badge(img, text, x, y, bg_color=HUD_WHITE, text_color=HUD_DARK
 
 def draw_tgp_frame(
     img, mode_label, tracking_state, elapsed_sec, fps, lock_pct,
-    dx, dy, error_px, pan, tilt, vel_total, servo_status="MOCK"
+    dx, dy, error_px, pan, tilt, vel_total, servo_status="MOCK", app_sim=1.0
 ):
     """Draws a clean military Targeting Pod (TGP) perimeter HUD."""
     h, w = img.shape[:2]
@@ -159,6 +160,8 @@ def draw_tgp_frame(
     cv2.putText(img, f"TLT {tilt:05.1f}", (w - m - 78, 105), font, 0.42, HUD_WHITE, 1, cv2.LINE_AA)
     if tracking_state in ("LOCK", "CST"):
         cv2.putText(img, f"V {vel_total:04.1f}D/S", (w - m - 82, 125), font, 0.38, HUD_DIM, 1, cv2.LINE_AA)
+        cv2.putText(img, f"APP {int(app_sim * 100):02d}%", (w - m - 82, 145), font, 0.38,
+                    RETICLE_GREEN if app_sim > 0.70 else RETICLE_AMBER, 1, cv2.LINE_AA)
 
     # 5. Bottom Rail Indicators & Timer
     cv2.putText(img, "OPT-PINK", (130, h - m + 5), font, 0.43, HUD_WHITE, 1, cv2.LINE_AA)
@@ -213,6 +216,63 @@ def draw_target_reticle(img, x, y, r, color=RETICLE_GREEN, thickness=2, is_predi
         cv2.circle(img, (x, y), 2, color, -1, cv2.LINE_AA)
 
 
+def draw_lead_pipper(
+    img, tgt_x: int, tgt_y: int, vel_pan: float, vel_tilt: float,
+    px_per_deg_x: float, px_per_deg_y: float, lead_time: float = 0.50
+) -> tuple[int, int]:
+    """
+    Renders an aerospace predictive lead pipper (future intercept reticle) on the TGP HUD.
+    Projects target position forward along the Kalman velocity vector: p_lead = p_tgt + v * t_lead.
+    """
+    speed_deg = math.hypot(vel_pan, vel_tilt)
+    if speed_deg < 2.0:
+        return tgt_x, tgt_y  # Collapse lead indicator when target is nearly stationary
+
+    # Forward-projected offset (angular -> pixel)
+    dx_lead = (vel_pan * lead_time) * px_per_deg_x
+    dy_lead = -(vel_tilt * lead_time) * px_per_deg_y  # Screen Y is inverted relative to elevation
+
+    lead_x = int(round(tgt_x + dx_lead))
+    lead_y = int(round(tgt_y + dy_lead))
+
+    pipper_col = (80, 220, 240)  # Military tactical cyan reticle
+
+    # 1. Segmented dashed lead trajectory vector
+    segments = 6
+    for i in range(0, segments, 2):
+        t1 = i / segments
+        t2 = (i + 1) / segments
+        p1 = (int(round(tgt_x + dx_lead * t1)), int(round(tgt_y + dy_lead * t1)))
+        p2 = (int(round(tgt_x + dx_lead * t2)), int(round(tgt_y + dy_lead * t2)))
+        cv2.line(img, p1, p2, pipper_col, 1, cv2.LINE_AA)
+
+    # 2. Predictive Lead Pipper Reticle (open center dot with crosshair tick marks)
+    pipper_r = 8
+    cv2.circle(img, (lead_x, lead_y), pipper_r, pipper_col, 1, cv2.LINE_AA)
+    cv2.circle(img, (lead_x, lead_y), 2, pipper_col, -1, cv2.LINE_AA)
+
+    tick = 4
+    cv2.line(img, (lead_x, lead_y - pipper_r - tick), (lead_x, lead_y - pipper_r), pipper_col, 1, cv2.LINE_AA)
+    cv2.line(img, (lead_x, lead_y + pipper_r), (lead_x, lead_y + pipper_r + tick), pipper_col, 1, cv2.LINE_AA)
+    cv2.line(img, (lead_x - pipper_r - tick, lead_y), (lead_x - pipper_r, lead_y), pipper_col, 1, cv2.LINE_AA)
+    cv2.line(img, (lead_x + pipper_r, lead_y), (lead_x + pipper_r + tick, lead_y), pipper_col, 1, cv2.LINE_AA)
+
+    # 3. Lead Time Telemetry Tag
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    cv2.putText(
+        img,
+        f"+{lead_time:.2f}S",
+        (lead_x + pipper_r + 4, lead_y + 4),
+        font,
+        0.33,
+        pipper_col,
+        1,
+        cv2.LINE_AA,
+    )
+
+    return lead_x, lead_y
+
+
 def main():
     init_csv()
 
@@ -254,14 +314,19 @@ def main():
         integral_limit=15.0, d_filter_alpha=0.20,
     )
 
-    # 2D Kalman Filter - Higher process noise accel (65 deg/s^2) for sharp, agile turn tracking
+    # 2D Kalman Filter with Adaptive Maneuver Gating for high-g turns and boundary bounces
     kf = KalmanFilter2D(
-        process_noise_accel=65.0,
-        measurement_noise=0.25,
+        process_noise_accel=120.0,
+        measurement_noise=0.30,
         max_coast_frames=75,
+        gate_threshold=16.0,
+        maneuver_gate_threshold=180.0,
     )
 
     # Hardware Serial Bridge to Arduino Nano + PCA9685 (auto-detects or runs in Virtual Mock)
+    # Electro-Optical Appearance Fingerprinting & Scale Estimation Engine
+    appearance = AppearanceModel()
+
     serial_gimbal = GimbalSerialController()
 
     current_pan = PAN_NEUTRAL
@@ -278,9 +343,13 @@ def main():
     flir_mode = False
     occlusion_until = 0.0
     log_flash_until = 0.0
+    target_radius = 22
+    current_app_sim = 1.0
+    show_pipper = True
+    lead_time = 0.50
 
     print("[BNE MARK 1] Optical Tracker Online.")
-    print("[CONTROLS] C = Toggle Webcam/Sim | T = Flight Dynamics | O = Occlusion | R = Reset | Q = Quit")
+    print("[CONTROLS] C = Webcam/Sim | T = Dynamics | D = Decoys | P = Lead Pipper | O = Occlude | R = Reset | Q = Quit")
 
     while True:
         ret, frame = get_frame()
@@ -309,32 +378,57 @@ def main():
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        # 2. Optical Centroid Detection
+        # 2. Multi-Candidate Detection & Validation Gating (Aerospace NNDA)
+        candidate_blobs = []
+        rejected_clutter = []
+        best_target = None
         optical_detected = False
-        raw_x, raw_y = -1, -1
-        target_radius = 22
 
         if contours and not is_occluded:
-            largest = max(contours, key=cv2.contourArea)
-            ((_, _), radius) = cv2.minEnclosingCircle(largest)
+            for c in contours:
+                ((cx, cy), radius) = cv2.minEnclosingCircle(c)
+                if radius >= MIN_TARGET_RADIUS:
+                    M = cv2.moments(c)
+                    if M["m00"] > 0:
+                        blob_x = int(M["m10"] / M["m00"])
+                        blob_y = int(M["m01"] / M["m00"])
+                        meas_pan = current_pan + (blob_x - frame_cx) / PX_PER_DEG_X
+                        meas_tilt = current_tilt - (blob_y - frame_cy) / PX_PER_DEG_Y
 
-            if radius >= MIN_TARGET_RADIUS:
-                M = cv2.moments(largest)
-                if M["m00"] > 0:
-                    raw_x = int(M["m10"] / M["m00"])
-                    raw_y = int(M["m01"] / M["m00"])
-                    target_radius = int(radius)
-                    optical_detected = True
+                        # Extract 2D Hue-Saturation color distribution signature
+                        cand_hist = appearance.extract_signature(frame, blob_x, blob_y, radius)
+                        app_sim = appearance.compute_similarity(cand_hist) if appearance.is_initialized else 1.0
 
-        # 3. Kalman State Estimation
+                        candidate_blobs.append({
+                            "screen_x": blob_x,
+                            "screen_y": blob_y,
+                            "pos_x": meas_pan,
+                            "pos_y": meas_tilt,
+                            "radius": radius,
+                            "appearance_similarity": app_sim,
+                            "has_appearance": appearance.is_initialized,
+                        })
+
+        # 3. Kalman State Prediction & Multi-Feature Association Gating
         pred_pan, pred_tilt = kf.predict(dt)
 
-        if optical_detected:
-            meas_pan = current_pan + (raw_x - frame_cx) / PX_PER_DEG_X
-            meas_tilt = current_tilt - (raw_y - frame_cy) / PX_PER_DEG_Y
-            est_pan, est_tilt = kf.update(meas_pan, meas_tilt)
+        if candidate_blobs:
+            best_target, rejected_clutter = kf.associate_and_gate(
+                candidate_blobs, target_radius=target_radius
+            )
+
+        if best_target is not None:
+            is_man = best_target.get("is_maneuvering", False)
+            est_pan, est_tilt = kf.update(
+                best_target["pos_x"], best_target["pos_y"], is_maneuvering=is_man
+            )
+            target_radius = int(best_target["radius"])
+            # Online adaptive appearance learning on confirmed target
+            appearance.update(frame, best_target["screen_x"], best_target["screen_y"], target_radius)
+            current_app_sim = best_target.get("appearance_similarity", 1.0)
             tracking_state = "LOCK"
             locked_frames += 1
+            optical_detected = True
         elif kf.is_coasting:
             est_pan, est_tilt = pred_pan, pred_tilt
             tracking_state = "CST"
@@ -343,8 +437,10 @@ def main():
             pan_pid.reset()
             tilt_pid.reset()
             kf.reset()
+            appearance.reset()
+            current_app_sim = 1.0
 
-        # 4. Closed-Loop Tracking & Search Scan
+        # 4. Closed-Loop Tracking with Kinematic Velocity Feedforward
         dx, dy, error_px = 0, 0, -1.0
         tgt_x, tgt_y = -1, -1
 
@@ -356,8 +452,14 @@ def main():
             dy = tgt_y - frame_cy
             error_px = math.hypot(dx, dy)
 
-            d_pan = pan_pid.update(dx, dt)
-            d_tilt = tilt_pid.update(-dy, dt)
+            # Velocity Feedforward: target motion in this time step (degrees)
+            # Injects 85% forward rate to bypass mechanical servo lag
+            vel_x, vel_y = kf.velocity
+            ff_pan = 0.85 * (vel_x * dt)
+            ff_tilt = 0.85 * (vel_y * dt)
+
+            d_pan = pan_pid.update(dx, dt, feedforward=ff_pan)
+            d_tilt = tilt_pid.update(-dy, dt, feedforward=ff_tilt)
 
             current_pan = float(np.clip(current_pan + d_pan, PAN_MIN, PAN_MAX))
             current_tilt = float(np.clip(current_tilt + d_tilt, TILT_MIN, TILT_MAX))
@@ -381,12 +483,24 @@ def main():
                 sim_cam.set_gimbal_angles(current_pan, current_tilt)
             serial_gimbal.send_angles(current_pan, current_tilt)
 
-        # 5. Display Frame Preparation
+        # 5. Display Frame Preparation & Velocity Extraction
+        vel_pan, vel_tilt = kf.velocity
+        vel_total = math.hypot(vel_pan, vel_tilt)
+
         if flir_mode:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             display = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
         else:
             display = frame
+
+        # Draw rejected clutter/decoys with dim red/gray warning boxes
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        for clut in rejected_clutter:
+            csx = clut["screen_x"]
+            csy = clut["screen_y"]
+            cr = int(clut["radius"])
+            cv2.rectangle(display, (csx - cr, csy - cr), (csx + cr, csy + cr), (75, 75, 75), 1, cv2.LINE_AA)
+            cv2.putText(display, "REJ", (csx - cr, csy - cr - 4), font, 0.35, (80, 80, 220), 1, cv2.LINE_AA)
 
         # Draw Target Reticle & Tracking Vector
         if tracking_state in ("LOCK", "CST"):
@@ -395,12 +509,17 @@ def main():
             cv2.line(display, (frame_cx, frame_cy), (tgt_x, tgt_y), (80, 140, 80), 1, cv2.LINE_AA)
             draw_target_reticle(display, tgt_x, tgt_y, target_radius, color=reticle_col, is_prediction=is_pred)
 
-        # 6. Telemetry & Velocity
+            # Predictive Lead Indicator (Future Intercept Pipper)
+            if show_pipper:
+                draw_lead_pipper(
+                    display, tgt_x, tgt_y, vel_pan, vel_tilt,
+                    PX_PER_DEG_X, PX_PER_DEG_Y, lead_time=lead_time
+                )
+
+        # 6. Telemetry & FPS
         avg_fps = len(frame_times) / max(sum(frame_times), 1e-6)
         lock_pct = (locked_frames / total_frames) * 100.0
         elapsed_sec = curr_t - start_t
-        vel_pan, vel_tilt = kf.velocity
-        vel_total = math.hypot(vel_pan, vel_tilt)
 
         # Mode label (e.g. SIM:CRU, SIM:EVA, SIM:TRB or CAM)
         if use_simulator:
@@ -414,13 +533,18 @@ def main():
         draw_tgp_boresight(display, frame_cx, frame_cy)
         draw_tgp_frame(
             display, mode_label, tracking_state, elapsed_sec, avg_fps, lock_pct,
-            dx, dy, error_px, current_pan, current_tilt, vel_total, servo_status=servo_tag
+            dx, dy, error_px, current_pan, current_tilt, vel_total,
+            servo_status=servo_tag, app_sim=current_app_sim
         )
 
         if is_occluded:
             rem = occlusion_until - curr_t
             draw_inverted_badge(display, f"OCCLUSION PULSE ({rem:.1f}S)", frame_cx - 95, 45,
                                 bg_color=RETICLE_AMBER, text_color=HUD_DARK)
+
+        if use_simulator and sim_cam.show_decoys:
+            draw_inverted_badge(display, "CLUTTER / DECOYS ACTIVE", frame_cx - 90, 66,
+                                bg_color=(60, 60, 180), text_color=HUD_WHITE)
 
         if curr_t < log_flash_until:
             draw_inverted_badge(display, "EVENT LOGGED", frame_cx - 52, height - 42,
@@ -456,6 +580,15 @@ def main():
             if use_simulator:
                 new_mode = sim_cam.cycle_flight_mode()
                 print(f"[TARGET] Flight Dynamics Profile: {new_mode}")
+        elif key == ord("d"):
+            # Toggle simulated clutter / decoys in simulator
+            if use_simulator:
+                d_state = sim_cam.toggle_decoys()
+                print(f"[CLUTTER] Simulated Decoys: {'ACTIVE' if d_state else 'DISABLED'}")
+        elif key == ord("p"):
+            # Toggle Predictive Lead Pipper
+            show_pipper = not show_pipper
+            print(f"[HUD] Predictive Lead Pipper (+{lead_time:.2f}s): {'ENABLED' if show_pipper else 'DISABLED'}")
         elif key == ord("o"):
             occlusion_until = curr_t + 1.2
             print("[TEST] 1.2s Occlusion Pulse triggered! Watch Kalman coasting.")

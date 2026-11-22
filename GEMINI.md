@@ -16,19 +16,20 @@
 
 ## Current Repo Structure & Progress
 - `mark-1-camera-tracker/requirements.txt` — `opencv-python`, `numpy`, `matplotlib`, `pyserial` (running in Python 3.15.2 `venv`).
-- `mark-1-camera-tracker/src/pid.py` — **Done & Verified.** `PIDController` with deadband, integral anti-windup, derivative low-pass filtering, and output rate limiting (tested critically damped, 0.75s settle time, ~0 overshoot).
-- `mark-1-camera-tracker/src/kalman.py` — **Done & Verified.** `KalmanFilter2D` with Constant Velocity (CV) physical motion model, Line-of-Sight (LOS) angular state estimation, continuous velocity tracking, and trajectory coasting during visual dropouts.
-- `mark-1-camera-tracker/src/simulator.py` — **Done & Refined.** Precision frame-paced 640x480 `VirtualCamera` with virtual 2-axis pan-tilt gimbal kinematics, Logitech C270 FOV projection, high-contrast world reference stripes (major 15°, minor 5°, horizon), and 3 flight dynamics profiles (`CRUISE`, `EVASIVE`, `TURBULENT`, cycled via `T` key).
-- `mark-1-camera-tracker/src/tracker.py` — **Done & Refined.** Full sensor fusion loop with dual-axis PID control, live TGP HUD telemetry (`LOCK` / `COAST` / `SCAN`), autonomous airspace search sweep on lost targets, timed 1.2s occlusion test (`O` key), instant boresight reset (`R` key), live real computer webcam toggle (`C` key), and hardware serial servo bridge.
+- `mark-1-camera-tracker/src/pid.py` — **Done & Verified.** `PIDController` with deadband, integral anti-windup, derivative low-pass filtering, output rate limiting, and **Kinematic Velocity Feedforward** ($K_{ff} \cdot \vec{v}_{tgt}$) to cancel physical servo tracking lag on high-speed flybys.
+- `mark-1-camera-tracker/src/appearance.py` — **Done & Verified.** `AppearanceModel` with 2D normalized Hue-Saturation histogram fingerprinting, Bhattacharyya similarity distance, and dynamic scale/aspect ratio tracking to defeat real-world false color clutter (shirts, reflections, orange/purple impostors).
+- `mark-1-camera-tracker/src/kalman.py` — **Done & Verified.** `KalmanFilter2D` with Constant Velocity (CV) physical motion model, Line-of-Sight (LOS) angular state estimation, continuous velocity tracking, and defense-grade Two-Tier Mahalanobis Validation Gating (Nominal $\chi^2 \le 16.0$ + Adaptive Maneuver Gating $\chi^2 \le 180.0$) fused with Bhattacharyya appearance gating.
+- `mark-1-camera-tracker/src/simulator.py` — **Done & Refined.** Precision frame-paced 640x480 `VirtualCamera` with virtual 2-axis pan-tilt gimbal kinematics, Logitech C270 FOV projection, high-contrast world reference stripes, 3 flight dynamics profiles (`CRUISE`, `EVASIVE`, `TURBULENT`), 3D distance/scale breathing (14px–34px), rolling-shutter directional motion blur, continuous aerodynamic momentum, and 4 heterogeneous clutter decoys.
+- `mark-1-camera-tracker/src/tracker.py` — **Done & Refined.** Full sensor fusion loop with multi-feature Nearest-Neighbor Data Association (NNDA), velocity feedforward gimbal drive, live TGP HUD telemetry with target appearance verification (`APP 98%`), rejected decoy visualization (`[REJ]`), autonomous airspace search sweep on lost targets, timed 1.2s occlusion test (`O` key), instant boresight reset (`R` key), live real computer webcam toggle (`C` key), and hardware serial servo bridge.
 - `mark-1-camera-tracker/src/calibrate_hsv.py` — **Done & Verified.** Interactive 6-slider real-time HSV color calibration utility with 3-panel diagnostics and configuration persistence.
 - `mark-1-camera-tracker/src/serial_interface.py` — **Done & Verified.** Non-blocking 50 Hz USB serial bridge with framed command packets (`<P,xxx,T,yyy>`), auto COM-port discovery, and zero-hardware Virtual Mock fallback.
 - `mark-1-camera-tracker/src/analyze_telemetry.py` — **Done & Verified.** Aerospace telemetry analysis dashboard computing RMS tracking error, state distribution, and plotting high-res graphs to `data/telemetry_analysis.png`.
+- `mark-1-camera-tracker/src/replay_telemetry.py` — **Done & Verified.** Interactive visual telemetry replay engine with timeline scrubbing, frame-by-frame stepping (`.` / `,`), variable playback speed, lead pipper projection, and demo flight synthesis.
 - `mark-1-camera-tracker/arduino/gimbal_firmware/gimbal_firmware.ino` — **Done & Verified.** Embedded C++ firmware for Arduino Nano + PCA9685 16-channel PWM driver with framed packet parser, MG90S travel limits ($15^\circ \text{–} 165^\circ$ Pan, $30^\circ \text{–} 150^\circ$ Tilt), and safety watchdog.
 - `mark-1-camera-tracker/arduino/README.md` — **Done.** Complete hardware schematic, pinouts, power distribution architecture, and Arduino IDE flashing instructions.
 
-## Next Steps (In Order)
-1. [DONE] Upgrade `simulator.py` with a virtual 2-axis pan-tilt gimbal and wire `pid.py` into `tracker.py`.
-2. [DONE] Add Kalman filter prediction for smoother high-speed tracking and safe "target lost" hold behavior.
-3. [DONE] Add real webcam toggle (`C` key), evasive flight profiles (`T` key), and automated telemetry dashboard (`analyze_telemetry.py`).
-4. [DONE] Write the Arduino Nano + PCA9685 serial firmware and hardware documentation in `mark-1-camera-tracker/arduino/`.
-5. Commit and push progress to GitHub (`Bafna-Norman-Enterprises/anti-air-defense`).
+## Advanced Aerospace Features Roadmap (Phase 2)
+1. [DONE] **Step 2.1: Target Association & Clutter Rejection:** Nearest-Neighbor Data Association (NNDA) with Mahalanobis Validation Gating ($\chi^2 \le 16.0$) to reject false pink objects/decoys (`D` key in simulator).
+2. [DONE] **Step 2.2: Predictive Lead Indicator (Future Intercept Pipper):** Compute forward-projected intercept point ($t_{\text{lead}} = 0.5\text{s}$) using Kalman velocity vector and draw a military-style lead pipper reticle on the TGP HUD (`P` key to toggle).
+3. [DONE] **Step 2.3: Tactical Flight Telemetry Replay:** Interactive visual replay tool (`replay_telemetry.py`) with timeline scrubbing to analyze logged flights frame-by-frame.
+4. Commit and push progress to GitHub (`Bafna-Norman-Enterprises/anti-air-defense`).

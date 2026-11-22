@@ -27,6 +27,8 @@ class VirtualCamera:
         self.width = width
         self.height = height
         self.ball_radius = ball_radius
+        self.base_ball_radius = ball_radius
+        self.target_dist = 2.0  # Apparent distance in meters (controls dynamic scale/radius)
         self.target_fps = target_fps
         self.frame_duration = 1.0 / target_fps
 
@@ -61,6 +63,15 @@ class VirtualCamera:
         self.base_v_tilt = 18.0
         self.v_pan = self.base_v_pan
         self.v_tilt = self.base_v_tilt
+
+        # Heterogeneous Decoy / Clutter targets for testing multi-feature appearance discrimination
+        self.show_decoys = False
+        self.decoys = [
+            {"pan": 70.0, "tilt": 80.0, "vx": -20.0, "vy": 14.0, "r": 20, "color": (193, 182, 255), "id": "Pink Decoy"},
+            {"pan": 115.0, "tilt": 105.0, "vx": 18.0, "vy": -22.0, "r": 25, "color": (155, 170, 255), "id": "Orange-Pink Clutter"},
+            {"pan": 85.0, "tilt": 65.0, "vx": -16.0, "vy": -18.0, "r": 18, "color": (230, 165, 215), "id": "Lavender Clutter"},
+            {"pan": 130.0, "tilt": 75.0, "vx": -22.0, "vy": 16.0, "r": 23, "color": (180, 145, 235), "id": "Magenta Clutter"},
+        ]
 
         # Flight dynamics profile
         self.flight_mode_idx = 0
@@ -110,6 +121,11 @@ class VirtualCamera:
         self.v_tilt = self.base_v_tilt
         self.sim_time = 0.0
 
+    def toggle_decoys(self) -> bool:
+        """Toggles simulated clutter/decoy targets on and off."""
+        self.show_decoys = not self.show_decoys
+        return self.show_decoys
+
     def _pace_frame(self):
         """Locks the simulator to target_fps using hybrid sleep + spin-wait."""
         self.next_frame_time += self.frame_duration
@@ -153,24 +169,38 @@ class VirtualCamera:
             current_vx += gust_x
             current_vy += gust_y
 
+        # Update target 3D distance/scale dynamics (distance oscillates between 1.4m and 3.0m)
+        self.target_dist = 2.1 + 0.8 * math.sin(self.sim_time * 1.6)
+        self.ball_radius = max(min(int(round(self.base_ball_radius * (2.0 / self.target_dist))), 34), 14)
+
         # Update target position in world angular space
         self.target_pan += current_vx * dt
         self.target_tilt += current_vy * dt
 
-        # Bounce target off world boundaries
-        if self.target_pan <= self.world_pan_min:
-            self.target_pan = self.world_pan_min
-            self.v_pan = abs(self.base_v_pan)
-        elif self.target_pan >= self.world_pan_max:
-            self.target_pan = self.world_pan_max
-            self.v_pan = -abs(self.base_v_pan)
+        # Realistic continuous aerodynamic boundary rebound (bounded ~3g turn acceleration)
+        margin = 4.0
+        turn_accel = 135.0
+        if self.target_pan <= self.world_pan_min + margin and self.v_pan < 0:
+            self.v_pan += turn_accel * dt
+            if self.v_pan > self.base_v_pan:
+                self.v_pan = self.base_v_pan
+        elif self.target_pan >= self.world_pan_max - margin and self.v_pan > 0:
+            self.v_pan -= turn_accel * dt
+            if self.v_pan < -self.base_v_pan:
+                self.v_pan = -self.base_v_pan
 
-        if self.target_tilt <= self.world_tilt_min:
-            self.target_tilt = self.world_tilt_min
-            self.v_tilt = abs(self.base_v_tilt)
-        elif self.target_tilt >= self.world_tilt_max:
-            self.target_tilt = self.world_tilt_max
-            self.v_tilt = -abs(self.base_v_tilt)
+        if self.target_tilt <= self.world_tilt_min + margin and self.v_tilt < 0:
+            self.v_tilt += turn_accel * dt
+            if self.v_tilt > self.base_v_tilt:
+                self.v_tilt = self.base_v_tilt
+        elif self.target_tilt >= self.world_tilt_max - margin and self.v_tilt > 0:
+            self.v_tilt -= turn_accel * dt
+            if self.v_tilt < -self.base_v_tilt:
+                self.v_tilt = -self.base_v_tilt
+
+        # Backup boundary clamp
+        self.target_pan = float(np.clip(self.target_pan, self.world_pan_min, self.world_pan_max))
+        self.target_tilt = float(np.clip(self.target_tilt, self.world_tilt_min, self.world_tilt_max))
 
         # Grab noisy background
         frame = self.bg_pool[self.bg_index].copy()
@@ -256,11 +286,28 @@ class VirtualCamera:
         screen_x = (self.width / 2.0) + (self.target_pan - self.cam_pan) * self.px_per_deg_x
         screen_y = (self.height / 2.0) - (self.target_tilt - self.cam_tilt) * self.px_per_deg_y
 
-        # Render target if within optical viewport (Light Pink)
+        # Render target if within optical viewport (Light Pink with rolling-shutter motion blur)
         r = self.ball_radius
         if -r <= screen_x <= self.width + r and -r <= screen_y <= self.height + r:
             center = (int(round(screen_x)), int(round(screen_y)))
-            # Anti-aliased light pink target ball (BGR: 193, 182, 255)
+
+            # Directional motion blur streak based on physical sensor transit speed
+            vx_px = current_vx * self.px_per_deg_x
+            vy_px = -current_vy * self.px_per_deg_y
+            speed_px = math.hypot(vx_px, vy_px)
+
+            if speed_px > 130.0:
+                dir_x = vx_px / speed_px
+                dir_y = vy_px / speed_px
+                max_streak = min(speed_px * (1.0 / self.target_fps) * 0.40, float(r * 1.4))
+                for step_idx in (3, 2, 1):
+                    offset = (step_idx / 3.0) * max_streak
+                    bx = int(round(screen_x - dir_x * offset))
+                    by = int(round(screen_y - dir_y * offset))
+                    blur_r = max(int(round(r * (1.0 - 0.08 * step_idx))), 4)
+                    cv2.circle(frame, (bx, by), blur_r, (168, 158, 225), -1, lineType=cv2.LINE_AA)
+
+            # Core anti-aliased light pink target ball (BGR: 193, 182, 255)
             cv2.circle(frame, center, r, (193, 182, 255), -1, lineType=cv2.LINE_AA)
 
             # Specular highlight
@@ -271,11 +318,42 @@ class VirtualCamera:
             cv2.circle(
                 frame,
                 highlight,
-                int(r * 0.25),
+                max(int(r * 0.25), 2),
                 (235, 225, 255),
                 -1,
                 lineType=cv2.LINE_AA,
             )
+
+        # Render simulated clutter/decoys if active
+        if self.show_decoys:
+            for d in self.decoys:
+                d["pan"] += d["vx"] * dt
+                d["tilt"] += d["vy"] * dt
+                # Bounce decoys off world boundaries
+                if d["pan"] <= self.world_pan_min:
+                    d["pan"] = self.world_pan_min
+                    d["vx"] = abs(d["vx"])
+                elif d["pan"] >= self.world_pan_max:
+                    d["pan"] = self.world_pan_max
+                    d["vx"] = -abs(d["vx"])
+
+                if d["tilt"] <= self.world_tilt_min:
+                    d["tilt"] = self.world_tilt_min
+                    d["vy"] = abs(d["vy"])
+                elif d["tilt"] >= self.world_tilt_max:
+                    d["tilt"] = self.world_tilt_max
+                    d["vy"] = -abs(d["vy"])
+
+                # Project decoy to screen
+                dsx = (self.width / 2.0) + (d["pan"] - self.cam_pan) * self.px_per_deg_x
+                dsy = (self.height / 2.0) - (d["tilt"] - self.cam_tilt) * self.px_per_deg_y
+                dr = d["r"]
+                color = d.get("color", (193, 182, 255))
+                if -dr <= dsx <= self.width + dr and -dr <= dsy <= self.height + dr:
+                    d_center = (int(round(dsx)), int(round(dsy)))
+                    cv2.circle(frame, d_center, dr, color, -1, lineType=cv2.LINE_AA)
+                    # Specular dot
+                    cv2.circle(frame, (int(round(dsx - dr * 0.3)), int(round(dsy - dr * 0.3))), max(int(dr * 0.2), 2), (235, 225, 255), -1, lineType=cv2.LINE_AA)
 
         return True, frame
 

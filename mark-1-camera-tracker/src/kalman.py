@@ -124,9 +124,13 @@ class KalmanFilter2D:
         if not candidates:
             return None, []
 
-        # If track is uninitialized, associate candidate closest to boresight center
+        # If track is uninitialized, prefer high-motion/high-saturation target over static clutter,
+        # falling back to candidate closest to boresight center if no acquisition score is provided.
         if not self.initialized:
-            best = min(candidates, key=lambda c: (c.get('screen_x', 320) - 320)**2 + (c.get('screen_y', 240) - 240)**2)
+            if 'acq_score' in candidates[0]:
+                best = max(candidates, key=lambda c: c['acq_score'])
+            else:
+                best = min(candidates, key=lambda c: (c.get('screen_x', 320) - 320)**2 + (c.get('screen_y', 240) - 240)**2)
             clutter = [c for c in candidates if c is not best]
             return best, clutter
 

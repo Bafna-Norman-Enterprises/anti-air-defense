@@ -42,8 +42,9 @@ os.makedirs(DATA_DIR, exist_ok=True)
 CSV_PATH = os.path.join(DATA_DIR, "tracking_telemetry.csv")
 CALIBRATION_PATH = os.path.join(DATA_DIR, "hsv_calibration.json")
 
-# Default HSV Color Range for Light Pink target (expanded to tolerate high-speed motion blur)
-LOWER_HSV = np.array([135, 25, 100])
+# Default HSV Color Range for Pink / Magenta targets
+# S >= 50 rejects washed-out curtains and glasses glare; V >= 65 catches indoor matte 3D prints
+LOWER_HSV = np.array([145, 50, 65])
 UPPER_HSV = np.array([179, 255, 255])
 
 # Load custom user calibration if available
@@ -350,12 +351,16 @@ def main():
     show_pipper = True
     lead_time = 0.50
 
-    # Interactive Click-to-Designate & Fullscreen state
+    # Interactive Click-to-Designate, Static Background Subtraction & Fullscreen state
     designated_click = None
     designation_flash_until = 0.0
     designated_color_name = "OPT-PINK"
     designation_msg = ""
     is_fullscreen = False
+    bg_snapshot = None
+    bg_flash_until = 0.0
+    bg_flash_msg = ""
+    prev_gray = None
 
     lower_hsv = LOWER_HSV.copy()
     upper_hsv = UPPER_HSV.copy()
@@ -372,7 +377,7 @@ def main():
     cv2.setMouseCallback(WINDOW_NAME, on_mouse_click)
 
     print("[BNE MARK 1] Optical Tracker Online.")
-    print("[CONTROLS] Click = Lock Object | F = Fullscreen | C = Cam/Sim | P = Pipper | T = Dynamics | D = Decoys | I = FLIR | R = Reset | Q = Quit")
+    print("[CONTROLS] Click = Lock Object | B = Zero Background | M = Mask Debug | F = Fullscreen | C = Cam/Sim | P = Pipper | T = Dynamics | D = Decoys | I = FLIR | R = Reset | Q = Quit")
 
     while True:
         ret, frame = get_frame()
@@ -394,10 +399,11 @@ def main():
             cx, cy = designated_click
             designated_click = None
 
-            px1 = max(0, cx - 10)
-            py1 = max(0, cy - 10)
-            px2 = min(width, cx + 10)
-            py2 = min(height, cy + 10)
+            # Tight 11x11 patch prevents background bleeding on small/thin 3D-printed toys
+            px1 = max(0, cx - 5)
+            py1 = max(0, cy - 5)
+            px2 = min(width, cx + 6)
+            py2 = min(height, cy + 6)
             patch = frame[py1:py2, px1:px2]
 
             if patch.size > 0:
@@ -406,28 +412,28 @@ def main():
                 med_s = int(np.median(patch_hsv[:, :, 1]))
                 med_v = int(np.median(patch_hsv[:, :, 2]))
 
-                # Guard: Reject desaturated/neutral objects (walls, desks, skin, shadows)
-                if med_s < 45:
+                # Guard: Reject desaturated/neutral objects (walls, desks, glare, shadows)
+                if med_s < 40:
                     designation_msg = "REJECTED: LOW SATURATION (CLICK COLORFUL OBJECT)"
                     designation_flash_until = curr_t + 2.0
-                    print(f"[DESIGNATION REJECTED] S={med_s} < 45. Please click a colorful target.")
-                elif med_v < 40:
+                    print(f"[DESIGNATION REJECTED] S={med_s} < 40. Please click a colorful target.")
+                elif med_v < 35:
                     designation_msg = "REJECTED: TOO DARK (CLICK WELL-LIT OBJECT)"
                     designation_flash_until = curr_t + 2.0
-                    print(f"[DESIGNATION REJECTED] V={med_v} < 40. Target is too dark.")
+                    print(f"[DESIGNATION REJECTED] V={med_v} < 35. Target is too dark.")
                 else:
-                    # Tight, robust color bounds with strict saturation floor
+                    # Tight, robust color bounds with saturation floor to block curtains & glare
                     std_h = float(np.std(patch_hsv[:, :, 0]))
                     std_s = float(np.std(patch_hsv[:, :, 1]))
-                    h_span = max(int(std_h * 2.2), 12)
+                    h_span = max(int(std_h * 2.2), 14)
                     s_span = max(int(std_s * 2.0), 35)
 
                     lower_h = med_h - h_span  # May be negative for red wrap-around
                     upper_h = med_h + h_span  # May exceed 179 for red wrap-around
-                    lower_s = max(25, med_s - s_span)  # S floor tolerates high-speed motion blur
+                    lower_s = max(40, med_s - s_span)
                     upper_s = min(255, med_s + s_span)
-                    lower_v = max(35, med_v - 65)
-                    upper_v = min(255, med_v + 65)
+                    lower_v = max(35, med_v - 75)
+                    upper_v = min(255, med_v + 75)
 
                     lower_hsv = np.array([lower_h, lower_s, lower_v])
                     upper_hsv = np.array([upper_h, upper_s, upper_v])
@@ -461,9 +467,19 @@ def main():
 
         is_occluded = curr_t < occlusion_until
 
-        # 1. Color Segmentation with Motion-Blur Tolerance
+        # 1. Color Segmentation with Motion & Static Background Clutter Rejection
         blurred = cv2.GaussianBlur(frame, (5, 5), 0)
         hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+
+        # Frame-to-frame motion mask (helps prioritize moving toys over static curtains)
+        curr_gray = cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY)
+        if prev_gray is not None and not use_simulator:
+            frame_diff = cv2.absdiff(curr_gray, prev_gray)
+            _, motion_mask = cv2.threshold(frame_diff, 16, 255, cv2.THRESH_BINARY)
+            motion_mask = cv2.dilate(motion_mask, None, iterations=2)
+        else:
+            motion_mask = None
+        prev_gray = curr_gray
 
         if lower_hsv[0] < 0:
             # Dual wrap-around mask for red
@@ -476,6 +492,12 @@ def main():
             mask = cv2.bitwise_or(mask1, mask2)
         else:
             mask = cv2.inRange(hsv, lower_hsv, upper_hsv)
+
+        # If operator captured a static room snapshot ('B' key), erase all stationary background
+        if bg_snapshot is not None and not use_simulator:
+            bg_diff = cv2.absdiff(blurred, bg_snapshot)
+            fg_mask = (np.max(bg_diff, axis=2) > 22).astype(np.uint8) * 255
+            mask = cv2.bitwise_and(mask, fg_mask)
 
         # Single-pass 3x3 morphology cleans noise without destroying thin motion streaks
         morph_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
@@ -493,8 +515,10 @@ def main():
         if contours and not is_occluded:
             for c in contours:
                 area = cv2.contourArea(c)
-                if area < 30:
-                    continue  # Ignore tiny noise specks
+                # Require larger area on initial acquisition to ignore tiny glasses glare specks
+                min_area = 85 if (not kf.initialized and not use_simulator) else 30
+                if area < min_area:
+                    continue
                 ((cx, cy), radius) = cv2.minEnclosingCircle(c)
                 if radius >= MIN_TARGET_RADIUS:
                     M = cv2.moments(c)
@@ -508,7 +532,7 @@ def main():
                         cand_hist = appearance.extract_signature(frame, blob_x, blob_y, radius)
                         app_sim = appearance.compute_similarity(cand_hist) if appearance.is_initialized else 1.0
 
-                        candidate_blobs.append({
+                        blob_dict = {
                             "screen_x": blob_x,
                             "screen_y": blob_y,
                             "pos_x": meas_pan,
@@ -516,7 +540,27 @@ def main():
                             "radius": radius,
                             "appearance_similarity": app_sim,
                             "has_appearance": appearance.is_initialized,
-                        })
+                        }
+
+                        # Compute acquisition score on real webcam so moving, saturated toys beat static curtains/glare
+                        if not kf.initialized and not use_simulator:
+                            bx, by, bw, bh = cv2.boundingRect(c)
+                            sat_roi = hsv[by:by + bh, bx:bx + bw, 1]
+                            mean_sat = float(np.mean(sat_roi)) if sat_roi.size > 0 else 0.0
+                            if motion_mask is not None:
+                                mot_roi = motion_mask[by:by + bh, bx:bx + bw]
+                                motion_score = float(np.mean(mot_roi)) / 255.0 if mot_roi.size > 0 else 0.0
+                            else:
+                                motion_score = 0.0
+                            dist_norm = math.hypot(blob_x - frame_cx, blob_y - frame_cy) / 400.0
+                            blob_dict["acq_score"] = (
+                                (motion_score * 3.0)
+                                + (mean_sat / 255.0) * 1.5
+                                + min(area / 2000.0, 1.0)
+                                - (dist_norm * 0.4)
+                            )
+
+                        candidate_blobs.append(blob_dict)
 
         # 3. Kalman State Prediction & Multi-Feature Association Gating
         pred_pan, pred_tilt = kf.predict(dt)
@@ -649,7 +693,10 @@ def main():
             target_label=designated_color_name
         )
 
-        if curr_t < designation_flash_until:
+        if curr_t < bg_flash_until:
+            draw_inverted_badge(display, bg_flash_msg, frame_cx - 115, 45,
+                                bg_color=(120, 230, 255), text_color=HUD_DARK)
+        elif curr_t < designation_flash_until:
             badge_bg = (240, 220, 80) if "REJECTED" not in designation_msg else (60, 60, 200)
             badge_text = HUD_DARK if "REJECTED" not in designation_msg else HUD_WHITE
             badge_x = frame_cx - 145 if "REJECTED" in designation_msg else frame_cx - 100
@@ -660,6 +707,10 @@ def main():
             rem = occlusion_until - curr_t
             draw_inverted_badge(display, f"OCCLUSION PULSE ({rem:.1f}S)", frame_cx - 95, 66,
                                 bg_color=RETICLE_AMBER, text_color=HUD_DARK)
+
+        if bg_snapshot is not None and not use_simulator:
+            draw_inverted_badge(display, "BG ZEROED", frame_cx - 42, 66,
+                                bg_color=(90, 140, 90), text_color=HUD_WHITE)
 
         if use_simulator and sim_cam.show_decoys:
             draw_inverted_badge(display, "CLUTTER / DECOYS ACTIVE", frame_cx - 90, 87,
@@ -688,6 +739,19 @@ def main():
                 ])
             log_flash_until = curr_t + 0.8
             print(f"[LOGGED] {ts} | {source_tag} | {tracking_state} | ERR: {error_px:.2f} px | VEL: {vel_total:.1f} d/s")
+        elif key in (ord("b"), ord("B")):
+            if not use_simulator:
+                if bg_snapshot is None:
+                    bg_snapshot = blurred.copy()
+                    kf.reset()
+                    appearance.reset()
+                    bg_flash_msg = "STATIC BACKGROUND ZEROED"
+                    print("[OPTICS] Static room background captured & masked out! Press 'B' again to clear.")
+                else:
+                    bg_snapshot = None
+                    bg_flash_msg = "BACKGROUND MASK CLEARED"
+                    print("[OPTICS] Static background mask cleared.")
+                bg_flash_until = curr_t + 1.8
         elif key == ord("c"):
             # Toggle between Simulator and Real Webcam
             use_simulator = not use_simulator
@@ -731,6 +795,7 @@ def main():
             tilt_pid.reset()
             kf.reset()
             appearance.reset()
+            bg_snapshot = None
             lower_hsv = LOWER_HSV.copy()
             upper_hsv = UPPER_HSV.copy()
             designated_color_name = "OPT-PINK"
@@ -738,7 +803,7 @@ def main():
             serial_gimbal.send_angles(PAN_NEUTRAL, TILT_NEUTRAL)
             if use_simulator:
                 sim_cam.reset_target()
-            print("[RESET] Gimbal, target, and color thresholds reset to defaults.")
+            print("[RESET] Gimbal, target, background mask, and color thresholds reset to defaults.")
         elif key == ord("m"):
             show_mask = not show_mask
             if not show_mask:

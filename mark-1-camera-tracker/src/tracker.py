@@ -351,7 +351,7 @@ def main():
     show_pipper = True
     lead_time = 0.50
 
-    # Interactive Click-to-Designate, Static Background Subtraction & Fullscreen state
+    # Interactive Click-to-Designate, Static Background Subtraction, Exclusion Zones & Fullscreen state
     designated_click = None
     designation_flash_until = 0.0
     designated_color_name = "OPT-PINK"
@@ -361,6 +361,9 @@ def main():
     bg_flash_until = 0.0
     bg_flash_msg = ""
     prev_gray = None
+    blacklist_zones = []      # [(x, y, radius), ...] permanent No-Track zones ('X' key)
+    temp_reject_zones = []    # [(x, y, radius, expire_t), ...] cooldown zones ('N' key)
+    allow_bright_pale = False
 
     lower_hsv = LOWER_HSV.copy()
     upper_hsv = UPPER_HSV.copy()
@@ -377,7 +380,7 @@ def main():
     cv2.setMouseCallback(WINDOW_NAME, on_mouse_click)
 
     print("[BNE MARK 1] Optical Tracker Online.")
-    print("[CONTROLS] Click = Lock Object | B = Zero Background | M = Mask Debug | F = Fullscreen | C = Cam/Sim | P = Pipper | T = Dynamics | D = Decoys | I = FLIR | R = Reset | Q = Quit")
+    print("[CONTROLS] Click = Lock | N = Next Target | X = Blacklist Spot | B = Zero BG | M = Mask | F = Fullscreen | C = Cam/Sim | R = Reset | Q = Quit")
 
     while True:
         ret, frame = get_frame()
@@ -453,6 +456,7 @@ def main():
                     else:
                         designated_color_name = "OPT-PINK"
 
+                    allow_bright_pale = (med_v > 205 and med_s < 85)
                     appearance.reset()
                     appearance.update(frame, cx, cy, radius=18.0)
 
@@ -466,6 +470,8 @@ def main():
                     print(f"[OPERATOR DESIGNATION] Locked on HSV({med_h}, {med_s}, {med_v}) -> Label: {designated_color_name}")
 
         is_occluded = curr_t < occlusion_until
+        # Expire old temporary target-cycle cooldowns
+        temp_reject_zones = [z for z in temp_reject_zones if z[3] > curr_t]
 
         # 1. Color Segmentation with Motion & Static Background Clutter Rejection
         blurred = cv2.GaussianBlur(frame, (5, 5), 0)
@@ -492,6 +498,11 @@ def main():
             mask = cv2.bitwise_or(mask1, mask2)
         else:
             mask = cv2.inRange(hsv, lower_hsv, upper_hsv)
+
+        # Anti-Glare Filter: monitor glare on eyeglasses is high-brightness + low-saturation
+        if not use_simulator and not allow_bright_pale:
+            glare_mask = (hsv[:, :, 2] > 205) & (hsv[:, :, 1] < 85)
+            mask[glare_mask] = 0
 
         # If operator captured a static room snapshot ('B' key), erase all stationary background
         if bg_snapshot is not None and not use_simulator:
@@ -525,6 +536,19 @@ def main():
                     if M["m00"] > 0:
                         blob_x = int(M["m10"] / M["m00"])
                         blob_y = int(M["m01"] / M["m00"])
+
+                        # Skip any candidate inside a permanent ('X') or temporary ('N') exclusion zone
+                        in_blacklist = any(
+                            math.hypot(blob_x - bx, blob_y - by) <= br
+                            for (bx, by, br) in blacklist_zones
+                        )
+                        in_temp_reject = any(
+                            math.hypot(blob_x - rx, blob_y - ry) <= rr
+                            for (rx, ry, rr, _) in temp_reject_zones
+                        )
+                        if in_blacklist or in_temp_reject:
+                            continue
+
                         meas_pan = current_pan + (blob_x - frame_cx) / PX_PER_DEG_X
                         meas_tilt = current_tilt - (blob_y - frame_cy) / PX_PER_DEG_Y
 
@@ -647,6 +671,13 @@ def main():
         else:
             display = frame
 
+        # Draw permanent No-Track Blacklist Zones ('X' key) on live webcam
+        if not use_simulator and blacklist_zones:
+            for (bx, by, br) in blacklist_zones:
+                cv2.circle(display, (bx, by), br, (65, 65, 160), 1, cv2.LINE_AA)
+                cv2.line(display, (bx - 6, by - 6), (bx + 6, by + 6), (65, 65, 160), 1, cv2.LINE_AA)
+                cv2.line(display, (bx - 6, by + 6), (bx + 6, by - 6), (65, 65, 160), 1, cv2.LINE_AA)
+
         # Draw rejected clutter/decoys with dim red/gray warning boxes ONLY in simulator when decoys are active
         if use_simulator and sim_cam.show_decoys:
             font = cv2.FONT_HERSHEY_SIMPLEX
@@ -739,6 +770,35 @@ def main():
                 ])
             log_flash_until = curr_t + 0.8
             print(f"[LOGGED] {ts} | {source_tag} | {tracking_state} | ERR: {error_px:.2f} px | VEL: {vel_total:.1f} d/s")
+        elif key in (ord("n"), ord("N")):
+            # Cycle to next candidate target & put a 4s cooldown on the rejected target
+            if tracking_state in ("LOCK", "CST") and tgt_x >= 0:
+                temp_reject_zones.append((tgt_x, tgt_y, 65, curr_t + 4.0))
+                remaining = [
+                    b for b in candidate_blobs
+                    if math.hypot(b["screen_x"] - tgt_x, b["screen_y"] - tgt_y) > 65
+                ]
+                kf.reset()
+                appearance.reset()
+                if remaining:
+                    nxt = max(remaining, key=lambda b: b.get("acq_score", b["radius"]))
+                    kf.update(nxt["pos_x"], nxt["pos_y"])
+                    appearance.update(frame, nxt["screen_x"], nxt["screen_y"], nxt["radius"])
+                    bg_flash_msg = "CYCLED TO NEXT TARGET"
+                    print(f"[TARGET] Cycled to next candidate at ({nxt['screen_x']}, {nxt['screen_y']})")
+                else:
+                    bg_flash_msg = "REJECTED TARGET (4S COOLDOWN)"
+                    print("[TARGET] Rejected current lock for 4s. Searching for next target...")
+                bg_flash_until = curr_t + 1.5
+        elif key in (ord("x"), ord("X")):
+            # Permanently blacklist current locked spot ('X' = No-Track Zone, cleared with 'R')
+            if tracking_state in ("LOCK", "CST") and tgt_x >= 0:
+                blacklist_zones.append((tgt_x, tgt_y, 70))
+                kf.reset()
+                appearance.reset()
+                bg_flash_msg = "NO-TRACK ZONE ADDED (R=CLEAR)"
+                bg_flash_until = curr_t + 1.8
+                print(f"[BLACKLIST] Added permanent 70px No-Track Zone at ({tgt_x}, {tgt_y}). Press 'R' to clear.")
         elif key in (ord("b"), ord("B")):
             if not use_simulator:
                 if bg_snapshot is None:
@@ -796,6 +856,9 @@ def main():
             kf.reset()
             appearance.reset()
             bg_snapshot = None
+            blacklist_zones.clear()
+            temp_reject_zones.clear()
+            allow_bright_pale = False
             lower_hsv = LOWER_HSV.copy()
             upper_hsv = UPPER_HSV.copy()
             designated_color_name = "OPT-PINK"
@@ -803,7 +866,7 @@ def main():
             serial_gimbal.send_angles(PAN_NEUTRAL, TILT_NEUTRAL)
             if use_simulator:
                 sim_cam.reset_target()
-            print("[RESET] Gimbal, target, background mask, and color thresholds reset to defaults.")
+            print("[RESET] Gimbal, target, background, blacklist zones, and color thresholds reset.")
         elif key == ord("m"):
             show_mask = not show_mask
             if not show_mask:

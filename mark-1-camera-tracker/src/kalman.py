@@ -1,3 +1,4 @@
+import math
 import numpy as np
 from typing import Optional
 
@@ -5,17 +6,17 @@ from typing import Optional
 class KalmanFilter2D:
     """
     2D Linear Kalman Filter with Mahalanobis Validation Gating and Nearest-Neighbor Data Association.
-    Uses a Constant Velocity (CV) physical motion model:
-        State vector:        x = [pos_x, pos_y, vel_x, vel_y]^T
+    Uses a 6-state Constant Acceleration (CA) ballistic motion model:
+        State vector:        x = [pos_x, pos_y, vel_x, vel_y, acc_x, acc_y]^T
         Measurement vector:  z = [pos_x, pos_y]^T
 
-    Provides smooth state estimation, velocity tracking, trajectory coasting,
-    and statistical clutter/decoy rejection using Chi-Squared validation gates.
+    Captures parabolic trajectories under gravity, smooths angular velocity/acceleration,
+    supports trajectory coasting, and rejects clutter via Chi-Squared validation gates.
     """
 
     def __init__(
         self,
-        process_noise_accel: float = 120.0,  # Target acceleration variance (units/s^2)
+        process_noise_accel: float = 120.0,  # Maneuverability tuning knob (drives jerk spectral density)
         measurement_noise: float = 0.30,     # Sensor/centroid noise standard deviation (degrees)
         max_coast_frames: int = 75,          # Coast for ~1.25s @ 60 FPS before declaring lost
         gate_threshold: float = 16.0,        # Nominal Chi-squared gate (~4-sigma statistical distance)
@@ -27,23 +28,23 @@ class KalmanFilter2D:
         self.gate_threshold = gate_threshold
         self.maneuver_gate_threshold = maneuver_gate_threshold
 
-        # State vector: [px, py, vx, vy]^T
-        self.x = np.zeros((4, 1), dtype=np.float64)
+        # State vector: [px, py, vx, vy, ax, ay]^T
+        self.x = np.zeros((6, 1), dtype=np.float64)
 
         # State covariance matrix P: initial uncertainty
-        self.P = np.diag([50.0, 50.0, 100.0, 100.0]).astype(np.float64)
+        self.P = np.diag([50.0, 50.0, 100.0, 100.0, 250.0, 250.0]).astype(np.float64)
 
         # Measurement matrix H: extracts px, py
         self.H = np.array([
-            [1.0, 0.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
         ], dtype=np.float64)
 
         # Measurement noise covariance R
         self.R = np.eye(2, dtype=np.float64) * (self.measurement_noise ** 2)
 
         # State transition identity template
-        self.I = np.eye(4, dtype=np.float64)
+        self.I = np.eye(6, dtype=np.float64)
 
         # Innovation covariance S and its inverse (computed during predict)
         self.S = np.eye(2, dtype=np.float64)
@@ -55,7 +56,7 @@ class KalmanFilter2D:
     def reset(self):
         """Resets filter state and clears track memory."""
         self.x.fill(0.0)
-        self.P = np.diag([50.0, 50.0, 100.0, 100.0]).astype(np.float64)
+        self.P = np.diag([50.0, 50.0, 100.0, 100.0, 250.0, 250.0]).astype(np.float64)
         self.initialized = False
         self.frames_since_update = 0
         self.S = np.eye(2, dtype=np.float64)
@@ -63,33 +64,48 @@ class KalmanFilter2D:
 
     def predict(self, dt: float) -> tuple[float, float]:
         """
-        Projects target state forward in time using the physical Constant Velocity motion model.
+        Projects target state forward in time using the 6-state Constant Acceleration (CA)
+        ballistic motion model with mild acceleration damping to prevent runaway coasting.
         Also calculates the innovation covariance S for validation gating.
         Returns predicted (pos_x, pos_y).
         """
         if not self.initialized:
             return 0.0, 0.0
 
-        # 1. State Transition Matrix F
-        F = np.array([
-            [1.0, 0.0, dt,  0.0],
-            [0.0, 1.0, 0.0, dt ],
-            [0.0, 0.0, 1.0, 0.0],
-            [0.0, 0.0, 0.0, 1.0],
-        ], dtype=np.float64)
-
-        # 2. Continuous White Noise Acceleration Covariance Q
         dt2 = dt * dt
         dt3 = dt2 * dt
         dt4 = dt3 * dt
-        q_var = self.process_noise_accel
+        dt5 = dt4 * dt
+        half_dt2 = 0.5 * dt2
+        accel_decay = math.exp(-dt / 1.5)  # Gentle Singer-style decay keeps long coasts stable
+
+        # 1. State Transition Matrix F (6x6)
+        F = np.array([
+            [1.0, 0.0, dt,  0.0, half_dt2, 0.0        ],
+            [0.0, 1.0, 0.0, dt,  0.0,      half_dt2   ],
+            [0.0, 0.0, 1.0, 0.0, dt,       0.0        ],
+            [0.0, 0.0, 0.0, 1.0, 0.0,      dt         ],
+            [0.0, 0.0, 0.0, 0.0, accel_decay, 0.0     ],
+            [0.0, 0.0, 0.0, 0.0, 0.0,      accel_decay],
+        ], dtype=np.float64)
+
+        # 2. Continuous White-Noise Jerk Covariance Matrix Q (6x6)
+        q_jerk = self.process_noise_accel * 20.0
+        q_pp = dt5 / 20.0
+        q_pv = dt4 / 8.0
+        q_pa = dt3 / 6.0
+        q_vv = dt3 / 3.0
+        q_va = dt2 / 2.0
+        q_aa = dt
 
         Q = np.array([
-            [dt4 / 4.0, 0.0,       dt3 / 2.0, 0.0      ],
-            [0.0,       dt4 / 4.0, 0.0,       dt3 / 2.0],
-            [dt3 / 2.0, 0.0,       dt2,       0.0      ],
-            [0.0,       dt3 / 2.0, 0.0,       dt2      ],
-        ], dtype=np.float64) * q_var
+            [q_pp, 0.0,  q_pv, 0.0,  q_pa, 0.0 ],
+            [0.0,  q_pp, 0.0,  q_pv, 0.0,  q_pa],
+            [q_pv, 0.0,  q_vv, 0.0,  q_va, 0.0 ],
+            [0.0,  q_pv, 0.0,  q_vv, 0.0,  q_va],
+            [q_pa, 0.0,  q_va, 0.0,  q_aa, 0.0 ],
+            [0.0,  q_pa, 0.0,  q_va, 0.0,  q_aa],
+        ], dtype=np.float64) * q_jerk
 
         # 3. Project state forward: x_pred = F * x
         self.x = F @ self.x
@@ -226,7 +242,9 @@ class KalmanFilter2D:
             self.x[1, 0] = z_y
             self.x[2, 0] = 0.0
             self.x[3, 0] = 0.0
-            self.P = np.diag([10.0, 10.0, 50.0, 50.0]).astype(np.float64)
+            self.x[4, 0] = 0.0
+            self.x[5, 0] = 0.0
+            self.P = np.diag([10.0, 10.0, 50.0, 50.0, 200.0, 200.0]).astype(np.float64)
             self.initialized = True
             self.frames_since_update = 0
             return z_x, z_y
@@ -237,6 +255,8 @@ class KalmanFilter2D:
             self.P[1, 1] += 60.0
             self.P[2, 2] += 800.0
             self.P[3, 3] += 800.0
+            self.P[4, 4] += 2000.0
+            self.P[5, 5] += 2000.0
             self.S = self.H @ self.P @ self.H.T + self.R
             try:
                 self.S_inv = np.linalg.inv(self.S)
@@ -251,6 +271,10 @@ class KalmanFilter2D:
 
         # Updated state estimate: x = x_pred + K * y
         self.x = self.x + (K @ y)
+
+        # Clamp extreme acceleration spikes to keep ballistic coasting physically bounded
+        self.x[4, 0] = float(np.clip(self.x[4, 0], -1500.0, 1500.0))
+        self.x[5, 0] = float(np.clip(self.x[5, 0], -1500.0, 1500.0))
 
         # Updated error covariance: P = (I - K * H) * P
         self.P = (self.I - (K @ self.H)) @ self.P
@@ -273,6 +297,11 @@ class KalmanFilter2D:
     def velocity(self) -> tuple[float, float]:
         """Returns estimated target velocity (vx, vy) in units/sec."""
         return float(self.x[2, 0]), float(self.x[3, 0])
+
+    @property
+    def acceleration(self) -> tuple[float, float]:
+        """Returns estimated target acceleration (ax, ay) in units/sec^2."""
+        return float(self.x[4, 0]), float(self.x[5, 0])
 
     @property
     def position(self) -> tuple[float, float]:

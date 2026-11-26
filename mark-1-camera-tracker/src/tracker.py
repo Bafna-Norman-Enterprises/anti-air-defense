@@ -12,6 +12,7 @@ from pid import PIDController
 from kalman import KalmanFilter2D
 from serial_interface import GimbalSerialController
 from appearance import AppearanceModel
+from hybrid_tracker import HybridFallbackTracker
 
 # ==========================================
 # CONFIGURATION & CONSTANTS
@@ -68,7 +69,20 @@ RETICLE_GREEN = (120, 255, 120)  # Light green for optical lock
 RETICLE_AMBER = (60, 200, 255)   # Amber/yellow for Kalman coasting
 
 
-def open_webcam(index=CAMERA_INDEX):
+def apply_webcam_exposure(cap, manual_exposure: bool, exposure_val: int):
+    """Configures manual fast-shutter exposure & white-balance lock on DirectShow webcams."""
+    if cap is None or not cap.isOpened():
+        return
+    if manual_exposure:
+        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)  # DirectShow manual mode
+        cap.set(cv2.CAP_PROP_EXPOSURE, float(exposure_val))
+        cap.set(cv2.CAP_PROP_AUTO_WB, 0)
+    else:
+        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)  # DirectShow auto mode
+        cap.set(cv2.CAP_PROP_AUTO_WB, 1)
+
+
+def open_webcam(index=CAMERA_INDEX, manual_exposure: bool = False, exposure_val: int = -5):
     """Attempts to open real computer webcam with MJPG fast streaming and zero latency."""
     cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
     if not cap.isOpened():
@@ -79,6 +93,10 @@ def open_webcam(index=CAMERA_INDEX):
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
         cap.set(cv2.CAP_PROP_FPS, 30)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Zero-latency frame buffer prevents stale frame lag
+        # Read 2 warm-up frames so Logitech/DirectShow drivers accept exposure property changes
+        cap.read()
+        cap.read()
+        apply_webcam_exposure(cap, manual_exposure, exposure_val)
         return cap
     return None
 
@@ -101,6 +119,25 @@ def init_csv():
         with open(CSV_PATH, mode="w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(headers)
+
+
+def append_telemetry_row(
+    tracking_state: str, use_simulator: bool, tgt_x: int, tgt_y: int,
+    frame_cx: int, frame_cy: int, dx: int, dy: int, error_px: float,
+    current_pan: float, current_tilt: float, vel_pan: float, vel_tilt: float
+):
+    """Appends one telemetry sample to the flight CSV log."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    source_tag = "SIM" if use_simulator else "CAM"
+    with open(CSV_PATH, mode="a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            ts, tracking_state, source_tag,
+            tgt_x, tgt_y, frame_cx, frame_cy, dx, dy, round(error_px, 2),
+            round(current_pan, 2), round(current_tilt, 2),
+            round(vel_pan, 2), round(vel_tilt, 2)
+        ])
+    return ts, source_tag
 
 
 def draw_inverted_badge(img, text, x, y, bg_color=HUD_WHITE, text_color=HUD_DARK):
@@ -149,6 +186,9 @@ def draw_tgp_frame(
     if tracking_state == "LOCK":
         draw_inverted_badge(img, "LOCK", m + 6, 175, bg_color=RETICLE_GREEN, text_color=HUD_DARK)
         cv2.putText(img, "TRK", (m + 6, 212), font, 0.45, HUD_WHITE, 1, cv2.LINE_AA)
+    elif tracking_state == "HYB":
+        draw_inverted_badge(img, "HYBRID", m + 2, 175, bg_color=(240, 220, 80), text_color=HUD_DARK)
+        cv2.putText(img, "FLOW", (m + 4, 212), font, 0.43, (240, 220, 80), 1, cv2.LINE_AA)
     elif tracking_state == "CST":
         draw_inverted_badge(img, "COAST", m + 4, 175, bg_color=RETICLE_AMBER, text_color=HUD_DARK)
         cv2.putText(img, "KF", (m + 6, 212), font, 0.45, RETICLE_AMBER, 1, cv2.LINE_AA)
@@ -161,7 +201,7 @@ def draw_tgp_frame(
     cv2.putText(img, f"IV {lock_pct:05.1f}%", (w - m - 78, 65), font, 0.42, HUD_DIM, 1, cv2.LINE_AA)
     cv2.putText(img, f"PAN {pan:05.1f}", (w - m - 78, 85), font, 0.42, HUD_WHITE, 1, cv2.LINE_AA)
     cv2.putText(img, f"TLT {tilt:05.1f}", (w - m - 78, 105), font, 0.42, HUD_WHITE, 1, cv2.LINE_AA)
-    if tracking_state in ("LOCK", "CST"):
+    if tracking_state in ("LOCK", "HYB", "CST"):
         cv2.putText(img, f"V {vel_total:04.1f}D/S", (w - m - 82, 125), font, 0.38, HUD_DIM, 1, cv2.LINE_AA)
         cv2.putText(img, f"APP {int(app_sim * 100):02d}%", (w - m - 82, 145), font, 0.38,
                     RETICLE_GREEN if app_sim > 0.70 else RETICLE_AMBER, 1, cv2.LINE_AA)
@@ -177,8 +217,8 @@ def draw_tgp_frame(
                 font, 0.48, HUD_WHITE, 1, cv2.LINE_AA)
 
     # 6. Tracking Error Readout
-    if tracking_state in ("LOCK", "CST"):
-        err_color = RETICLE_GREEN if tracking_state == "LOCK" else RETICLE_AMBER
+    if tracking_state in ("LOCK", "HYB", "CST"):
+        err_color = RETICLE_GREEN if tracking_state == "LOCK" else ((240, 220, 80) if tracking_state == "HYB" else RETICLE_AMBER)
         cv2.putText(img, f"ERR {error_px:05.1f} PX", (m + 10, h - m - 32),
                     font, 0.43, err_color, 1, cv2.LINE_AA)
         cv2.putText(img, f"dX {dx:+04d}  dY {dy:+04d}", (m + 10, h - m - 14),
@@ -221,32 +261,34 @@ def draw_target_reticle(img, x, y, r, color=RETICLE_GREEN, thickness=2, is_predi
 
 def draw_lead_pipper(
     img, tgt_x: int, tgt_y: int, vel_pan: float, vel_tilt: float,
-    px_per_deg_x: float, px_per_deg_y: float, lead_time: float = 0.50
+    px_per_deg_x: float, px_per_deg_y: float, lead_time: float = 0.50,
+    acc_pan: float = 0.0, acc_tilt: float = 0.0
 ) -> tuple[int, int]:
     """
-    Renders an aerospace predictive lead pipper (future intercept reticle) on the TGP HUD.
-    Projects target position forward along the Kalman velocity vector: p_lead = p_tgt + v * t_lead.
+    Renders a 2nd-order ballistic predictive lead pipper on the TGP HUD.
+    Projects target position forward along the Kalman velocity & acceleration vectors:
+        p_lead(t) = p_tgt + v * t + 0.5 * a * t^2
     """
     speed_deg = math.hypot(vel_pan, vel_tilt)
-    if speed_deg < 2.0:
+    if speed_deg < 2.0 and math.hypot(acc_pan, acc_tilt) < 15.0:
         return tgt_x, tgt_y  # Collapse lead indicator when target is nearly stationary
 
-    # Forward-projected offset (angular -> pixel)
-    dx_lead = (vel_pan * lead_time) * px_per_deg_x
-    dy_lead = -(vel_tilt * lead_time) * px_per_deg_y  # Screen Y is inverted relative to elevation
+    def project_offset(tau: float) -> tuple[int, int]:
+        dx_deg = vel_pan * tau + 0.5 * acc_pan * (tau * tau)
+        dy_deg = vel_tilt * tau + 0.5 * acc_tilt * (tau * tau)
+        return (
+            int(round(tgt_x + dx_deg * px_per_deg_x)),
+            int(round(tgt_y - dy_deg * px_per_deg_y)),
+        )
 
-    lead_x = int(round(tgt_x + dx_lead))
-    lead_y = int(round(tgt_y + dy_lead))
-
+    lead_x, lead_y = project_offset(lead_time)
     pipper_col = (80, 220, 240)  # Military tactical cyan reticle
 
-    # 1. Segmented dashed lead trajectory vector
+    # 1. Curved segmented ballistic trajectory arc
     segments = 6
     for i in range(0, segments, 2):
-        t1 = i / segments
-        t2 = (i + 1) / segments
-        p1 = (int(round(tgt_x + dx_lead * t1)), int(round(tgt_y + dy_lead * t1)))
-        p2 = (int(round(tgt_x + dx_lead * t2)), int(round(tgt_y + dy_lead * t2)))
+        p1 = project_offset(lead_time * (i / segments))
+        p2 = project_offset(lead_time * ((i + 1) / segments))
         cv2.line(img, p1, p2, pipper_col, 1, cv2.LINE_AA)
 
     # 2. Predictive Lead Pipper Reticle (open center dot with crosshair tick marks)
@@ -289,7 +331,7 @@ def main():
             return sim_cam.read()
         else:
             if webcam is None or not webcam.isOpened():
-                webcam = open_webcam()
+                webcam = open_webcam(manual_exposure=manual_exposure, exposure_val=exposure_val)
                 if webcam is None:
                     print("[WARNING] Could not open computer webcam. Reverting to Simulator.")
                     use_simulator = True
@@ -327,8 +369,9 @@ def main():
     )
 
     # Hardware Serial Bridge to Arduino Nano + PCA9685 (auto-detects or runs in Virtual Mock)
-    # Electro-Optical Appearance Fingerprinting & Scale Estimation Engine
+    # Electro-Optical Appearance Fingerprinting & Hybrid Texture/Flow Fallback
     appearance = AppearanceModel()
+    hybrid = HybridFallbackTracker()
 
     serial_gimbal = GimbalSerialController()
 
@@ -364,6 +407,9 @@ def main():
     blacklist_zones = []      # [(x, y, radius), ...] permanent No-Track zones ('X' key)
     temp_reject_zones = []    # [(x, y, radius, expire_t), ...] cooldown zones ('N' key)
     allow_bright_pale = False
+    manual_exposure = False
+    exposure_val = -5
+    continuous_recording = False
 
     lower_hsv = LOWER_HSV.copy()
     upper_hsv = UPPER_HSV.copy()
@@ -380,7 +426,7 @@ def main():
     cv2.setMouseCallback(WINDOW_NAME, on_mouse_click)
 
     print("[BNE MARK 1] Optical Tracker Online.")
-    print("[CONTROLS] Click = Lock | N = Next Target | X = Blacklist Spot | B = Zero BG | M = Mask | F = Fullscreen | C = Cam/Sim | R = Reset | Q = Quit")
+    print("[CONTROLS] Click = Lock | N = Next | X = Blacklist | B = Zero BG | E = Exposure | [/] = Shutter | V = Record | F = Fullscreen | C = Cam/Sim | R = Reset | Q = Quit")
 
     while True:
         ret, frame = get_frame()
@@ -459,6 +505,8 @@ def main():
                     allow_bright_pale = (med_v > 205 and med_s < 85)
                     appearance.reset()
                     appearance.update(frame, cx, cy, radius=18.0)
+                    hybrid.reset()
+                    hybrid.update_reference(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), cx, cy, radius=18.0)
 
                     meas_pan = current_pan + (cx - frame_cx) / PX_PER_DEG_X
                     meas_tilt = current_tilt - (cy - frame_cy) / PX_PER_DEG_Y
@@ -601,12 +649,37 @@ def main():
             )
             target_radius = int(best_target["radius"])
 
-            # Online adaptive appearance learning on confirmed target
+            # Online adaptive appearance learning & periodic hybrid texture/flow snapshot
             appearance.update(frame, best_target["screen_x"], best_target["screen_y"], target_radius)
             current_app_sim = best_target.get("appearance_similarity", 1.0)
+            if total_frames % 4 == 0 and current_app_sim > 0.65:
+                hybrid.update_reference(curr_gray, best_target["screen_x"], best_target["screen_y"], target_radius)
             tracking_state = "LOCK"
             locked_frames += 1
             optical_detected = True
+        elif kf.initialized and not is_occluded and hybrid.is_ready:
+            # Hybrid Fallback: Optical Flow / NCC Template keeps lock if color drops out in shadow/glare
+            pred_px = int(round(frame_cx + (pred_pan - current_pan) * PX_PER_DEG_X))
+            pred_py = int(round(frame_cy - (pred_tilt - current_tilt) * PX_PER_DEG_Y))
+            hyb_res = hybrid.track_fallback(curr_gray, pred_px, pred_py, target_radius)
+            if hyb_res is not None:
+                hx, hy, h_conf, _ = hyb_res
+                hyb_pan = current_pan + (hx - frame_cx) / PX_PER_DEG_X
+                hyb_tilt = current_tilt - (hy - frame_cy) / PX_PER_DEG_Y
+                est_pan, est_tilt = kf.update(hyb_pan, hyb_tilt)
+                tracking_state = "HYB"
+                locked_frames += 1
+            elif kf.is_coasting:
+                est_pan, est_tilt = pred_pan, pred_tilt
+                tracking_state = "CST"
+            else:
+                tracking_state = "SRCH"
+                pan_pid.reset()
+                tilt_pid.reset()
+                kf.reset()
+                appearance.reset()
+                hybrid.reset()
+                current_app_sim = 1.0
         elif kf.is_coasting:
             est_pan, est_tilt = pred_pan, pred_tilt
             tracking_state = "CST"
@@ -616,13 +689,14 @@ def main():
             tilt_pid.reset()
             kf.reset()
             appearance.reset()
+            hybrid.reset()
             current_app_sim = 1.0
 
         # 4. Closed-Loop Tracking with Kinematic Velocity Feedforward
         dx, dy, error_px = 0, 0, -1.0
         tgt_x, tgt_y = -1, -1
 
-        if tracking_state in ("LOCK", "CST"):
+        if tracking_state in ("LOCK", "HYB", "CST"):
             tgt_x = int(round(frame_cx + (est_pan - current_pan) * PX_PER_DEG_X))
             tgt_y = int(round(frame_cy - (est_tilt - current_tilt) * PX_PER_DEG_Y))
 
@@ -661,8 +735,9 @@ def main():
                 sim_cam.set_gimbal_angles(current_pan, current_tilt)
             serial_gimbal.send_angles(current_pan, current_tilt)
 
-        # 5. Display Frame Preparation & Velocity Extraction
+        # 5. Display Frame Preparation & Velocity/Acceleration Extraction
         vel_pan, vel_tilt = kf.velocity
+        acc_pan, acc_tilt = kf.acceleration
         vel_total = math.hypot(vel_pan, vel_tilt)
 
         if flir_mode:
@@ -688,19 +763,33 @@ def main():
                 cv2.rectangle(display, (csx - cr, csy - cr), (csx + cr, csy + cr), (75, 75, 75), 1, cv2.LINE_AA)
                 cv2.putText(display, "REJ", (csx - cr, csy - cr - 4), font, 0.35, (80, 80, 220), 1, cv2.LINE_AA)
 
-        # Draw Target Reticle & Tracking Vector
-        if tracking_state in ("LOCK", "CST"):
+        # Draw Target Reticle & Ballistic Lead Pipper
+        if tracking_state in ("LOCK", "HYB", "CST"):
             is_pred = (tracking_state == "CST")
-            reticle_col = RETICLE_AMBER if is_pred else RETICLE_GREEN
+            if tracking_state == "LOCK":
+                reticle_col = RETICLE_GREEN
+            elif tracking_state == "HYB":
+                reticle_col = (240, 220, 80)
+            else:
+                reticle_col = RETICLE_AMBER
             cv2.line(display, (frame_cx, frame_cy), (tgt_x, tgt_y), (80, 140, 80), 1, cv2.LINE_AA)
             draw_target_reticle(display, tgt_x, tgt_y, target_radius, color=reticle_col, is_prediction=is_pred)
 
-            # Predictive Lead Indicator (Future Intercept Pipper)
+            # 2nd-order Ballistic Predictive Lead Indicator
             if show_pipper:
                 draw_lead_pipper(
                     display, tgt_x, tgt_y, vel_pan, vel_tilt,
-                    PX_PER_DEG_X, PX_PER_DEG_Y, lead_time=lead_time
+                    PX_PER_DEG_X, PX_PER_DEG_Y, lead_time=lead_time,
+                    acc_pan=acc_pan, acc_tilt=acc_tilt
                 )
+
+        # Continuous Flight Recording ('V' key)
+        if continuous_recording:
+            append_telemetry_row(
+                tracking_state, use_simulator, tgt_x, tgt_y,
+                frame_cx, frame_cy, dx, dy, error_px,
+                current_pan, current_tilt, vel_pan, vel_tilt
+            )
 
         # 6. Telemetry & FPS
         avg_fps = len(frame_times) / max(sum(frame_times), 1e-6)
@@ -711,7 +800,7 @@ def main():
         if use_simulator:
             mode_label = f"SIM:{sim_cam.flight_mode[:3]}"
         else:
-            mode_label = "CAM:REAL"
+            mode_label = f"CAM:E{exposure_val}" if manual_exposure else "CAM:AUTO"
 
         servo_tag = "LINK" if serial_gimbal.is_connected else "MOCK"
 
@@ -723,6 +812,9 @@ def main():
             servo_status=servo_tag, app_sim=current_app_sim,
             target_label=designated_color_name
         )
+
+        if continuous_recording:
+            draw_inverted_badge(display, "REC", 26, 45, bg_color=(60, 60, 220), text_color=HUD_WHITE)
 
         if curr_t < bg_flash_until:
             draw_inverted_badge(display, bg_flash_msg, frame_cx - 115, 45,
@@ -758,21 +850,44 @@ def main():
         # 8. Keyboard Controls
         key = cv2.waitKey(1) & 0xFF
         if key == ord(" "):
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-            source_tag = "SIM" if use_simulator else "CAM"
-            with open(CSV_PATH, mode="a", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    ts, tracking_state, source_tag,
-                    tgt_x, tgt_y, frame_cx, frame_cy, dx, dy, round(error_px, 2),
-                    round(current_pan, 2), round(current_tilt, 2),
-                    round(vel_pan, 2), round(vel_tilt, 2)
-                ])
+            ts, source_tag = append_telemetry_row(
+                tracking_state, use_simulator, tgt_x, tgt_y,
+                frame_cx, frame_cy, dx, dy, error_px,
+                current_pan, current_tilt, vel_pan, vel_tilt
+            )
             log_flash_until = curr_t + 0.8
             print(f"[LOGGED] {ts} | {source_tag} | {tracking_state} | ERR: {error_px:.2f} px | VEL: {vel_total:.1f} d/s")
+        elif key in (ord("v"), ord("V")):
+            continuous_recording = not continuous_recording
+            bg_flash_msg = "FLIGHT RECORDING: ON" if continuous_recording else "FLIGHT RECORDING: OFF"
+            bg_flash_until = curr_t + 1.5
+            print(f"[TELEMETRY] Continuous Flight Recording: {'ON' if continuous_recording else 'OFF'} -> {CSV_PATH}")
+        elif key in (ord("e"), ord("E")):
+            if not use_simulator and webcam is not None:
+                manual_exposure = not manual_exposure
+                apply_webcam_exposure(webcam, manual_exposure, exposure_val)
+                bg_flash_msg = f"MANUAL EXP: {exposure_val}" if manual_exposure else "AUTO EXPOSURE"
+                bg_flash_until = curr_t + 1.5
+                print(f"[OPTICS] Webcam Exposure Mode: {bg_flash_msg}")
+        elif key in (ord("["), ord("{")):
+            if not use_simulator and webcam is not None:
+                manual_exposure = True
+                exposure_val = max(-10, exposure_val - 1)
+                apply_webcam_exposure(webcam, True, exposure_val)
+                bg_flash_msg = f"SHUTTER FASTER: EXP {exposure_val}"
+                bg_flash_until = curr_t + 1.2
+                print(f"[OPTICS] Manual Exposure: {exposure_val} (Faster shutter / less blur)")
+        elif key in (ord("]"), ord("}")):
+            if not use_simulator and webcam is not None:
+                manual_exposure = True
+                exposure_val = min(-1, exposure_val + 1)
+                apply_webcam_exposure(webcam, True, exposure_val)
+                bg_flash_msg = f"SHUTTER BRIGHTER: EXP {exposure_val}"
+                bg_flash_until = curr_t + 1.2
+                print(f"[OPTICS] Manual Exposure: {exposure_val} (Brighter)")
         elif key in (ord("n"), ord("N")):
             # Cycle to next candidate target & put a 4s cooldown on the rejected target
-            if tracking_state in ("LOCK", "CST") and tgt_x >= 0:
+            if tracking_state in ("LOCK", "HYB", "CST") and tgt_x >= 0:
                 temp_reject_zones.append((tgt_x, tgt_y, 65, curr_t + 4.0))
                 remaining = [
                     b for b in candidate_blobs
@@ -780,6 +895,7 @@ def main():
                 ]
                 kf.reset()
                 appearance.reset()
+                hybrid.reset()
                 if remaining:
                     nxt = max(remaining, key=lambda b: b.get("acq_score", b["radius"]))
                     kf.update(nxt["pos_x"], nxt["pos_y"])
@@ -792,10 +908,11 @@ def main():
                 bg_flash_until = curr_t + 1.5
         elif key in (ord("x"), ord("X")):
             # Permanently blacklist current locked spot ('X' = No-Track Zone, cleared with 'R')
-            if tracking_state in ("LOCK", "CST") and tgt_x >= 0:
+            if tracking_state in ("LOCK", "HYB", "CST") and tgt_x >= 0:
                 blacklist_zones.append((tgt_x, tgt_y, 70))
                 kf.reset()
                 appearance.reset()
+                hybrid.reset()
                 bg_flash_msg = "NO-TRACK ZONE ADDED (R=CLEAR)"
                 bg_flash_until = curr_t + 1.8
                 print(f"[BLACKLIST] Added permanent 70px No-Track Zone at ({tgt_x}, {tgt_y}). Press 'R' to clear.")
@@ -805,6 +922,7 @@ def main():
                     bg_snapshot = blurred.copy()
                     kf.reset()
                     appearance.reset()
+                    hybrid.reset()
                     bg_flash_msg = "STATIC BACKGROUND ZEROED"
                     print("[OPTICS] Static room background captured & masked out! Press 'B' again to clear.")
                 else:
@@ -855,6 +973,7 @@ def main():
             tilt_pid.reset()
             kf.reset()
             appearance.reset()
+            hybrid.reset()
             bg_snapshot = None
             blacklist_zones.clear()
             temp_reject_zones.clear()

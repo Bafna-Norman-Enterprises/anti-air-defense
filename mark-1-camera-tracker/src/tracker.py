@@ -13,6 +13,7 @@ from kalman import KalmanFilter2D
 from serial_interface import GimbalSerialController
 from appearance import AppearanceModel
 from hybrid_tracker import HybridFallbackTracker
+from track_manager import TrackManager
 
 # ==========================================
 # CONFIGURATION & CONSTANTS
@@ -154,7 +155,8 @@ def draw_inverted_badge(img, text, x, y, bg_color=HUD_WHITE, text_color=HUD_DARK
 def draw_tgp_frame(
     img, mode_label, tracking_state, elapsed_sec, fps, lock_pct,
     dx, dy, error_px, pan, tilt, vel_total, servo_status="MOCK",
-    app_sim=1.0, target_label="OPT-PINK"
+    app_sim=1.0, target_label="OPT-PINK",
+    track_id_label="TRK-01", tqi=99.0, flight_class="HOVER", active_tracks=0
 ):
     """Draws a clean military Targeting Pod (TGP) perimeter HUD."""
     h, w = img.shape[:2]
@@ -201,10 +203,13 @@ def draw_tgp_frame(
     cv2.putText(img, f"IV {lock_pct:05.1f}%", (w - m - 78, 65), font, 0.42, HUD_DIM, 1, cv2.LINE_AA)
     cv2.putText(img, f"PAN {pan:05.1f}", (w - m - 78, 85), font, 0.42, HUD_WHITE, 1, cv2.LINE_AA)
     cv2.putText(img, f"TLT {tilt:05.1f}", (w - m - 78, 105), font, 0.42, HUD_WHITE, 1, cv2.LINE_AA)
+    cv2.putText(img, f"TWS {active_tracks:02d} TRK", (w - m - 82, 125), font, 0.36, HUD_DIM, 1, cv2.LINE_AA)
     if tracking_state in ("LOCK", "HYB", "CST"):
-        cv2.putText(img, f"V {vel_total:04.1f}D/S", (w - m - 82, 125), font, 0.38, HUD_DIM, 1, cv2.LINE_AA)
-        cv2.putText(img, f"APP {int(app_sim * 100):02d}%", (w - m - 82, 145), font, 0.38,
-                    RETICLE_GREEN if app_sim > 0.70 else RETICLE_AMBER, 1, cv2.LINE_AA)
+        cv2.putText(img, f"V {vel_total:04.1f}D/S", (w - m - 82, 145), font, 0.36, HUD_DIM, 1, cv2.LINE_AA)
+        cv2.putText(img, f"TQI {int(tqi):02d}%", (w - m - 82, 165), font, 0.36,
+                    RETICLE_GREEN if tqi >= 70.0 else RETICLE_AMBER, 1, cv2.LINE_AA)
+        cv2.putText(img, flight_class[:9], (w - m - 82, 185), font, 0.34, (80, 220, 240), 1, cv2.LINE_AA)
+        cv2.putText(img, track_id_label, (w - m - 82, 205), font, 0.36, HUD_WHITE, 1, cv2.LINE_AA)
 
     # 5. Bottom Rail Indicators & Timer
     cv2.putText(img, target_label, (130, h - m + 5), font, 0.43, HUD_WHITE, 1, cv2.LINE_AA)
@@ -359,18 +364,13 @@ def main():
         integral_limit=20.0, d_filter_alpha=0.30,
     )
 
-    # 2D Kalman Filter tuned for gravitational freefall (g ≈ 500 deg/s^2) & rapid projectile throws
-    kf = KalmanFilter2D(
-        process_noise_accel=650.0,
-        measurement_noise=0.20,
-        max_coast_frames=60,
-        gate_threshold=25.0,
-        maneuver_gate_threshold=900.0,
+    # Multi-Target Track-While-Scan (MTT/TWS) Engine + Hybrid Texture/Flow Fallback
+    tm = TrackManager(
+        max_tracks=6,
+        confirm_hits=3,
+        max_tentative_misses=3,
+        max_confirmed_misses=50,
     )
-
-    # Hardware Serial Bridge to Arduino Nano + PCA9685 (auto-detects or runs in Virtual Mock)
-    # Electro-Optical Appearance Fingerprinting & Hybrid Texture/Flow Fallback
-    appearance = AppearanceModel()
     hybrid = HybridFallbackTracker()
 
     serial_gimbal = GimbalSerialController()
@@ -391,6 +391,9 @@ def main():
     log_flash_until = 0.0
     target_radius = 22
     current_app_sim = 1.0
+    current_tqi = 0.0
+    current_flight_class = "HOVER"
+    current_track_label = "TRK-01"
     show_pipper = True
     lead_time = 0.50
 
@@ -503,15 +506,12 @@ def main():
                         designated_color_name = "OPT-PINK"
 
                     allow_bright_pale = (med_v > 205 and med_s < 85)
-                    appearance.reset()
-                    appearance.update(frame, cx, cy, radius=18.0)
                     hybrid.reset()
                     hybrid.update_reference(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), cx, cy, radius=18.0)
 
                     meas_pan = current_pan + (cx - frame_cx) / PX_PER_DEG_X
                     meas_tilt = current_tilt - (cy - frame_cy) / PX_PER_DEG_Y
-                    kf.reset()
-                    kf.update(meas_pan, meas_tilt)
+                    tm.designate_at(meas_pan, meas_tilt, cx, cy, frame, radius=18.0)
 
                     designation_msg = f"DESIGNATED: {designated_color_name}"
                     designation_flash_until = curr_t + 1.5
@@ -572,10 +572,11 @@ def main():
         optical_detected = False
 
         if contours and not is_occluded:
+            has_primary = tm.get_primary() is not None
             for c in contours:
                 area = cv2.contourArea(c)
-                # Require larger area on initial acquisition to ignore tiny glasses glare specks
-                min_area = 85 if (not kf.initialized and not use_simulator) else 30
+                # Require larger area when scanning to ignore tiny glasses glare specks
+                min_area = 85 if (not has_primary and not use_simulator) else 30
                 if area < min_area:
                     continue
                 ((cx, cy), radius) = cv2.minEnclosingCircle(c)
@@ -600,22 +601,16 @@ def main():
                         meas_pan = current_pan + (blob_x - frame_cx) / PX_PER_DEG_X
                         meas_tilt = current_tilt - (blob_y - frame_cy) / PX_PER_DEG_Y
 
-                        # Extract 2D Hue-Saturation color distribution signature
-                        cand_hist = appearance.extract_signature(frame, blob_x, blob_y, radius)
-                        app_sim = appearance.compute_similarity(cand_hist) if appearance.is_initialized else 1.0
-
                         blob_dict = {
                             "screen_x": blob_x,
                             "screen_y": blob_y,
                             "pos_x": meas_pan,
                             "pos_y": meas_tilt,
                             "radius": radius,
-                            "appearance_similarity": app_sim,
-                            "has_appearance": appearance.is_initialized,
                         }
 
                         # Compute acquisition score on real webcam so moving, saturated toys beat static curtains/glare
-                        if not kf.initialized and not use_simulator:
+                        if not use_simulator:
                             bx, by, bw, bh = cv2.boundingRect(c)
                             sat_roi = hsv[by:by + bh, bx:bx + bw, 1]
                             mean_sat = float(np.mean(sat_roi)) if sat_roi.size > 0 else 0.0
@@ -634,31 +629,29 @@ def main():
 
                         candidate_blobs.append(blob_dict)
 
-        # 3. Kalman State Prediction & Multi-Feature Association Gating
-        pred_pan, pred_tilt = kf.predict(dt)
+        # 3. Multi-Target Track-While-Scan (TWS) Update & Primary Target Selection
+        tm.step(
+            candidate_blobs, dt, frame,
+            current_pan, current_tilt, frame_cx, frame_cy,
+            PX_PER_DEG_X, PX_PER_DEG_Y, is_occluded=is_occluded,
+        )
+        primary = tm.get_primary()
 
-        if candidate_blobs:
-            best_target, rejected_clutter = kf.associate_and_gate(
-                candidate_blobs, target_radius=target_radius
-            )
-
-        if best_target is not None:
-            is_man = best_target.get("is_maneuvering", False)
-            est_pan, est_tilt = kf.update(
-                best_target["pos_x"], best_target["pos_y"], is_maneuvering=is_man
-            )
-            target_radius = int(best_target["radius"])
-
-            # Online adaptive appearance learning & periodic hybrid texture/flow snapshot
-            appearance.update(frame, best_target["screen_x"], best_target["screen_y"], target_radius)
-            current_app_sim = best_target.get("appearance_similarity", 1.0)
+        if primary is not None and primary.misses == 0:
+            est_pan, est_tilt = primary.kf.position
+            target_radius = int(primary.last_radius)
+            current_app_sim = primary.last_app_sim
+            current_tqi = primary.tqi
+            current_flight_class = primary.flight_class
+            current_track_label = primary.label
             if total_frames % 4 == 0 and current_app_sim > 0.65:
-                hybrid.update_reference(curr_gray, best_target["screen_x"], best_target["screen_y"], target_radius)
+                hybrid.update_reference(curr_gray, primary.last_screen_x, primary.last_screen_y, target_radius)
             tracking_state = "LOCK"
             locked_frames += 1
             optical_detected = True
-        elif kf.initialized and not is_occluded and hybrid.is_ready:
+        elif primary is not None and not is_occluded and hybrid.is_ready:
             # Hybrid Fallback: Optical Flow / NCC Template keeps lock if color drops out in shadow/glare
+            pred_pan, pred_tilt = primary.kf.position
             pred_px = int(round(frame_cx + (pred_pan - current_pan) * PX_PER_DEG_X))
             pred_py = int(round(frame_cy - (pred_tilt - current_tilt) * PX_PER_DEG_Y))
             hyb_res = hybrid.track_fallback(curr_gray, pred_px, pred_py, target_radius)
@@ -666,37 +659,43 @@ def main():
                 hx, hy, h_conf, _ = hyb_res
                 hyb_pan = current_pan + (hx - frame_cx) / PX_PER_DEG_X
                 hyb_tilt = current_tilt - (hy - frame_cy) / PX_PER_DEG_Y
-                est_pan, est_tilt = kf.update(hyb_pan, hyb_tilt)
+                est_pan, est_tilt = primary.kf.update(hyb_pan, hyb_tilt)
+                primary.misses = 0
+                primary.status = "CONFIRMED"
+                primary.classify_kinematics()
+                primary.update_quality(matched=True, d2=2.0)
+                current_tqi = primary.tqi
+                current_flight_class = primary.flight_class
+                current_track_label = primary.label
                 tracking_state = "HYB"
                 locked_frames += 1
-            elif kf.is_coasting:
-                est_pan, est_tilt = pred_pan, pred_tilt
-                tracking_state = "CST"
             else:
-                tracking_state = "SRCH"
-                pan_pid.reset()
-                tilt_pid.reset()
-                kf.reset()
-                appearance.reset()
-                hybrid.reset()
-                current_app_sim = 1.0
-        elif kf.is_coasting:
-            est_pan, est_tilt = pred_pan, pred_tilt
+                est_pan, est_tilt = primary.kf.position
+                current_tqi = primary.tqi
+                current_flight_class = primary.flight_class
+                current_track_label = primary.label
+                tracking_state = "CST"
+        elif primary is not None:
+            est_pan, est_tilt = primary.kf.position
+            current_tqi = primary.tqi
+            current_flight_class = primary.flight_class
+            current_track_label = primary.label
             tracking_state = "CST"
         else:
             tracking_state = "SRCH"
             pan_pid.reset()
             tilt_pid.reset()
-            kf.reset()
-            appearance.reset()
             hybrid.reset()
             current_app_sim = 1.0
+            current_tqi = 0.0
+            current_flight_class = "HOVER"
+            current_track_label = "TRK-00"
 
         # 4. Closed-Loop Tracking with Kinematic Velocity Feedforward
         dx, dy, error_px = 0, 0, -1.0
         tgt_x, tgt_y = -1, -1
 
-        if tracking_state in ("LOCK", "HYB", "CST"):
+        if tracking_state in ("LOCK", "HYB", "CST") and primary is not None:
             tgt_x = int(round(frame_cx + (est_pan - current_pan) * PX_PER_DEG_X))
             tgt_y = int(round(frame_cy - (est_tilt - current_tilt) * PX_PER_DEG_Y))
 
@@ -706,7 +705,7 @@ def main():
 
             # Velocity Feedforward: target motion in this time step (degrees)
             # Injects 95% forward rate to bypass mechanical servo lag and catch fast drops/throws
-            vel_x, vel_y = kf.velocity
+            vel_x, vel_y = primary.kf.velocity
             ff_pan = 0.95 * (vel_x * dt)
             ff_tilt = 0.95 * (vel_y * dt)
 
@@ -736,8 +735,12 @@ def main():
             serial_gimbal.send_angles(current_pan, current_tilt)
 
         # 5. Display Frame Preparation & Velocity/Acceleration Extraction
-        vel_pan, vel_tilt = kf.velocity
-        acc_pan, acc_tilt = kf.acceleration
+        if primary is not None:
+            vel_pan, vel_tilt = primary.kf.velocity
+            acc_pan, acc_tilt = primary.kf.acceleration
+        else:
+            vel_pan, vel_tilt = 0.0, 0.0
+            acc_pan, acc_tilt = 0.0, 0.0
         vel_total = math.hypot(vel_pan, vel_tilt)
 
         if flir_mode:
@@ -753,17 +756,18 @@ def main():
                 cv2.line(display, (bx - 6, by - 6), (bx + 6, by + 6), (65, 65, 160), 1, cv2.LINE_AA)
                 cv2.line(display, (bx - 6, by + 6), (bx + 6, by - 6), (65, 65, 160), 1, cv2.LINE_AA)
 
-        # Draw rejected clutter/decoys with dim red/gray warning boxes ONLY in simulator when decoys are active
-        if use_simulator and sim_cam.show_decoys:
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            for clut in rejected_clutter:
-                csx = clut["screen_x"]
-                csy = clut["screen_y"]
-                cr = int(clut["radius"])
-                cv2.rectangle(display, (csx - cr, csy - cr), (csx + cr, csy + cr), (75, 75, 75), 1, cv2.LINE_AA)
-                cv2.putText(display, "REJ", (csx - cr, csy - cr - 4), font, 0.35, (80, 80, 220), 1, cv2.LINE_AA)
+        # Draw Secondary Track-While-Scan (TWS) Targets
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        secondary_tracks = tm.get_secondary_tracks()
+        for sec in secondary_tracks:
+            sx, sy = sec.last_screen_x, sec.last_screen_y
+            sr = max(int(sec.last_radius * 1.15), 10)
+            sec_col = (180, 180, 100) if sec.status == "CONFIRMED" else (110, 110, 140)
+            cv2.rectangle(display, (sx - sr, sy - sr), (sx + sr, sy + sr), sec_col, 1, cv2.LINE_AA)
+            cv2.putText(display, f"{sec.label} {int(sec.tqi)}%", (sx - sr, sy - sr - 4),
+                        font, 0.33, sec_col, 1, cv2.LINE_AA)
 
-        # Draw Target Reticle & Ballistic Lead Pipper
+        # Draw Target Reticle & Ballistic Lead Pipper for Primary Target
         if tracking_state in ("LOCK", "HYB", "CST"):
             is_pred = (tracking_state == "CST")
             if tracking_state == "LOCK":
@@ -805,12 +809,17 @@ def main():
         servo_tag = "LINK" if serial_gimbal.is_connected else "MOCK"
 
         # 7. Draw HUD
+        active_tws_count = len([t for t in tm.tracks.values() if t.status in ("CONFIRMED", "COAST")])
         draw_tgp_boresight(display, frame_cx, frame_cy)
         draw_tgp_frame(
             display, mode_label, tracking_state, elapsed_sec, avg_fps, lock_pct,
             dx, dy, error_px, current_pan, current_tilt, vel_total,
             servo_status=servo_tag, app_sim=current_app_sim,
-            target_label=designated_color_name
+            target_label=designated_color_name,
+            track_id_label=current_track_label,
+            tqi=current_tqi,
+            flight_class=current_flight_class,
+            active_tracks=active_tws_count,
         )
 
         if continuous_recording:
@@ -886,32 +895,28 @@ def main():
                 bg_flash_until = curr_t + 1.2
                 print(f"[OPTICS] Manual Exposure: {exposure_val} (Brighter)")
         elif key in (ord("n"), ord("N")):
-            # Cycle to next candidate target & put a 4s cooldown on the rejected target
-            if tracking_state in ("LOCK", "HYB", "CST") and tgt_x >= 0:
-                temp_reject_zones.append((tgt_x, tgt_y, 65, curr_t + 4.0))
-                remaining = [
-                    b for b in candidate_blobs
-                    if math.hypot(b["screen_x"] - tgt_x, b["screen_y"] - tgt_y) > 65
-                ]
-                kf.reset()
-                appearance.reset()
-                hybrid.reset()
-                if remaining:
-                    nxt = max(remaining, key=lambda b: b.get("acq_score", b["radius"]))
-                    kf.update(nxt["pos_x"], nxt["pos_y"])
-                    appearance.update(frame, nxt["screen_x"], nxt["screen_y"], nxt["radius"])
-                    bg_flash_msg = "CYCLED TO NEXT TARGET"
-                    print(f"[TARGET] Cycled to next candidate at ({nxt['screen_x']}, {nxt['screen_y']})")
+            # Cycle to next track in TWS table, or put a 4s cooldown if only 1 track exists
+            if primary is not None:
+                if len(tm.tracks) > 1:
+                    nxt = tm.cycle_primary()
+                    hybrid.reset()
+                    bg_flash_msg = f"CYCLED -> {nxt.label}"
+                    print(f"[TWS] Switched Primary Target to {nxt.label} ({nxt.flight_class})")
                 else:
+                    if tgt_x >= 0:
+                        temp_reject_zones.append((tgt_x, tgt_y, 65, curr_t + 4.0))
+                    tm.tracks.pop(primary.track_id, None)
+                    tm.primary_id = None
+                    hybrid.reset()
                     bg_flash_msg = "REJECTED TARGET (4S COOLDOWN)"
-                    print("[TARGET] Rejected current lock for 4s. Searching for next target...")
+                    print("[TWS] Rejected current lock for 4s. Searching for next target...")
                 bg_flash_until = curr_t + 1.5
         elif key in (ord("x"), ord("X")):
             # Permanently blacklist current locked spot ('X' = No-Track Zone, cleared with 'R')
-            if tracking_state in ("LOCK", "HYB", "CST") and tgt_x >= 0:
+            if primary is not None and tgt_x >= 0:
                 blacklist_zones.append((tgt_x, tgt_y, 70))
-                kf.reset()
-                appearance.reset()
+                tm.tracks.pop(primary.track_id, None)
+                tm.primary_id = None
                 hybrid.reset()
                 bg_flash_msg = "NO-TRACK ZONE ADDED (R=CLEAR)"
                 bg_flash_until = curr_t + 1.8
@@ -920,8 +925,7 @@ def main():
             if not use_simulator:
                 if bg_snapshot is None:
                     bg_snapshot = blurred.copy()
-                    kf.reset()
-                    appearance.reset()
+                    tm.reset()
                     hybrid.reset()
                     bg_flash_msg = "STATIC BACKGROUND ZEROED"
                     print("[OPTICS] Static room background captured & masked out! Press 'B' again to clear.")
@@ -934,7 +938,9 @@ def main():
             # Toggle between Simulator and Real Webcam
             use_simulator = not use_simulator
             if not use_simulator and webcam is None:
-                webcam = open_webcam()
+                webcam = open_webcam(manual_exposure=manual_exposure, exposure_val=exposure_val)
+            tm.reset()
+            hybrid.reset()
             print(f"[FEED] Switched Video Source: {'SIMULATOR' if use_simulator else 'REAL WEBCAM'}")
         elif key == ord("t"):
             # Cycle simulator flight dynamics profile
@@ -971,8 +977,7 @@ def main():
             current_tilt = TILT_NEUTRAL
             pan_pid.reset()
             tilt_pid.reset()
-            kf.reset()
-            appearance.reset()
+            tm.reset()
             hybrid.reset()
             bg_snapshot = None
             blacklist_zones.clear()
